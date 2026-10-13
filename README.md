@@ -100,3 +100,11 @@ python3 install_app.py thermal_battery \
 
 Requires `requests` and `paho-mqtt` (both present in the AppDaemon image) and
 `arctic_mqtt_password` in `secrets.yaml`.
+
+## Morning report
+
+```sh
+python3 ~/docker/appdaemon/conf/apps/thermal_battery/tools/report.py --days 3
+```
+
+Shows the current plan and charge per zone, graded cycles (morning low, k change and reason), learned `k`, the last 24 h of events, and problems found in the log.

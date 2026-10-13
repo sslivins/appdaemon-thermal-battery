@@ -53,6 +53,12 @@ thermal_battery:
   sensor_stale_min: 30
   # Extra notify services to call on a new problem (e.g. notify/mobile_app_x).
   notify_services: []
+  # Phone push via the home HA (BDL has no mobile_app). Test by firing the
+  # HA event `thermal_battery_test_notify` on BDL.
+  remote_notify:
+    - url: http://192.168.1.192:8123
+      token: !secret mi_ha_notify_token
+      service: notify.mobile_app_stefan
 
   # Charge order = list order (big zones first). k units: C*min per C*h.
   zones:

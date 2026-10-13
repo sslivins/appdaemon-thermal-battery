@@ -128,6 +128,11 @@ class ThermalBattery(hass.Hass):
         self.weather_stale_h = float(w.get("stale_hours", 3))
 
         self.notify_services = list(a.get("notify_services", []) or [])
+        # Push via another HA instance's REST API (e.g. the home HA that has
+        # the phone's mobile_app): [{url, token, service}]
+        self.remote_notify = [r for r in (a.get("remote_notify") or [])
+                              if r.get("url") and r.get("token")
+                              and r.get("service")]
 
         self.zones = []
         for i, z in enumerate(a.get("zones", [])):
@@ -189,6 +194,7 @@ class ThermalBattery(hass.Hass):
             self.weather_refresh_min * 60), int(self.weather_refresh_min * 60))
         self.run_daily(self._on_grade_time, self.grade_time)
         self.run_every(self._watchdog, "now+60", 300)
+        self.listen_event(self._on_test_notify, "thermal_battery_test_notify")
 
     def terminate(self):
         try:
@@ -883,16 +889,39 @@ class ThermalBattery(hass.Hass):
                 except Exception as exc:  # noqa: BLE001
                     self.log("notify %s failed: %s" % (svc, exc),
                              level="ERROR")
+            self._push("Thermal Battery problem", message)
             self._publish_status()
         elif key in self._problems:
             del self._problems[key]
             self.log("RECOVERED [%s]" % key, level="WARNING")
+            self._push("Thermal Battery recovered", "Cleared: %s" % key)
             try:
                 self.call_service("persistent_notification/dismiss",
                                   notification_id=nid)
             except Exception:  # noqa: BLE001
                 pass
             self._publish_status()
+
+    def _push(self, title, message):
+        for r in self.remote_notify:
+            svc = str(r["service"]).replace("notify.", "").replace(
+                "notify/", "")
+            try:
+                resp = requests.post(
+                    "%s/api/services/notify/%s" % (
+                        str(r["url"]).rstrip("/"), svc),
+                    headers={"Authorization": "Bearer %s" % r["token"]},
+                    json={"title": title, "message": message}, timeout=10)
+                resp.raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                self.log("remote push %s via %s failed: %s" % (
+                    svc, r["url"], exc), level="ERROR")
+
+    def _on_test_notify(self, event, data, kwargs):
+        self.log("test notify requested")
+        self._push("Thermal Battery test",
+                   (data or {}).get("message") or
+                   "Test alert from Sun Peaks (appdaemon.bdl).")
 
     # ================================================================ MQTT ==
     def _mqtt_init(self):

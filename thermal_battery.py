@@ -644,7 +644,7 @@ class ThermalBattery(hass.Hass):
             self._backup_clear_since = now
 
         sup, sup_age = self._read(self.supply_entity)
-        self._stale_check(self.supply_entity, sup, sup_age)
+        any_flow_long = False
         do_sample = now - self._last_sample >= self.sample_s
         if do_sample:
             self._last_sample = now
@@ -655,7 +655,6 @@ class ThermalBattery(hass.Hass):
             zs = live["zones"][name]
             c = self._climate(z)
             ret, ret_age = self._read(z["return_entity"])
-            self._stale_check(z["return_entity"], ret, ret_age)
             if not c["available"]:
                 self._set_problem("climate:" + name, True,
                                   "%s is unavailable." % z["climate"])
@@ -666,12 +665,14 @@ class ThermalBattery(hass.Hass):
                 zs["call_start"] = now
             elif not calling:
                 zs["call_start"] = None
+            flow_long = bool(calling and now - zs["call_start"]
+                             >= self.sensor_stale_min * 60)
+            any_flow_long = any_flow_long or flow_long
+            self._stale_check(z["return_entity"], ret, ret_age, flow_long)
 
             # --- heat accounting ---------------------------------------
             if (calling and dt_min > 0 and sup is not None and ret is not None
-                    and now - zs["call_start"] >= self.flush_min * 60
-                    and (sup_age or 0) < self.sensor_stale_min * 60
-                    and (ret_age or 0) < self.sensor_stale_min * 60):
+                    and now - zs["call_start"] >= self.flush_min * 60):
                 q = max(0.0, sup - ret) * dt_min
                 if zs["session"]:
                     zs["delivered"] += q
@@ -702,6 +703,7 @@ class ThermalBattery(hass.Hass):
                                 int(bool(zs["session"]))))
 
         self._maybe_start_sessions(away, backup, now)
+        self._stale_check(self.supply_entity, sup, sup_age, any_flow_long)
 
         if samples:
             with self._db_lock:
@@ -716,12 +718,17 @@ class ThermalBattery(hass.Hass):
         if reason not in zs["invalid"]:
             zs["invalid"].append(reason)
 
-    def _stale_check(self, entity, val, age):
-        bad = val is None or age is None or age > self.sensor_stale_min * 60
+    def _stale_check(self, entity, val, age, flowing=True):
+        """Unavailable => problem. Unchanged for too long => problem, but only
+        while water is moving past the probe (HA drops identical MQTT
+        payloads, so a stable reading in a still pipe is normal)."""
+        frozen = flowing and age is not None and age > self.sensor_stale_min * 60
+        bad = val is None or frozen
         self._set_problem(
             "sensor:" + entity, bad,
             "%s is %s." % (entity, "unavailable" if val is None else
-                           "stale (%.0f min)" % ((age or 0) / 60)))
+                           "frozen (unchanged %.0f min while flowing)"
+                           % ((age or 0) / 60)))
 
     # ============================================================ sessions ==
     def _in_window(self, now, min_left_min=0):

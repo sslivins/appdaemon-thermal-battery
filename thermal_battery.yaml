@@ -48,7 +48,9 @@ thermal_battery:
     refresh_min: 30
     stale_hours: 3          # scream if no good fetch for this long
 
-  sensor_stale_min: 10
+  # Probe readings unchanged this long *while water flows past them* => alarm
+  # (HA drops identical MQTT payloads, so stable-when-idle is normal).
+  sensor_stale_min: 30
   # Extra notify services to call on a new problem (e.g. notify/mobile_app_x).
   notify_services: []
 

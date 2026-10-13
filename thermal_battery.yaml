@@ -1,0 +1,100 @@
+thermal_battery:
+  module: thermal_battery
+  class: ThermalBattery
+  log: thermal_battery_log
+
+  timezone: America/Vancouver
+
+  # Start in shadow mode: never touches a setpoint, but plans, logs what it
+  # would do, and learns k from the backstop (12C thermostat) heat.
+  dry_run: true
+
+  # Only operate while the house is in AWAY mode.
+  away_entity: input_boolean.home_away_mode_enabled
+  away_state: "on"
+  # Charging pauses (and restores baselines) while the electric backup runs.
+  backup_entity: binary_sensor.aeco_1988_backup_running
+
+  # Common radiant supply header (thermux).
+  radiant_supply_entity: sensor.thermux_radiant_supply
+
+  away_setpoint: 12.0       # thermostat baseline / backstop
+  charge_setpoint: 22.0     # setpoint used to force a zone call while charging
+  target_low: 12.5          # desired overnight-to-morning air low
+  overshoot_deadband_c: 0.5 # low above target+this (and no backstop) => overshoot
+  overshoot_frac_per_c: 0.15
+  unplanned_eps: 20         # C*min of backstop heat treated as "none"
+  unplanned_min_eps: 10     # ...and backstop call minutes treated as "none"
+  hdh_base_c: 15.0          # heating-degree-hour balance point
+
+  grade_time: "09:00"       # cycle boundary: grade yesterday, plan today
+  night_start: "22:00"      # morning-low search window = night_start..grade_time
+  window_earliest: "11:00"  # charging window = warmest window_hours block
+  window_latest: "19:00"    #   inside [earliest, latest]
+  window_hours: 5
+  min_session_min: 30       # don't start a charge with less window left
+  max_concurrent: 2         # zones charging at once
+  flush_min: 3              # ignore dT for this long after each call starts
+  backup_cooldown_min: 20
+
+  learn_alpha: 0.3          # k += alpha * (k_obs - k)
+  max_step_frac: 0.25       # max daily k change
+  min_learn_hdh: 10         # skip learning on mild days
+
+  weather:                  # Open-Meteo (no key). House coords from HA.
+    latitude: 50.8846
+    longitude: -119.8633
+    elevation: 1315
+    refresh_min: 30
+    stale_hours: 3          # scream if no good fetch for this long
+
+  sensor_stale_min: 10
+  # Extra notify services to call on a new problem (e.g. notify/mobile_app_x).
+  notify_services: []
+
+  # Charge order = list order (big zones first). k units: C*min per C*h.
+  zones:
+    - name: main_floor
+      climate: climate.main_floor
+      return_entity: sensor.thermux_main_floor_return
+      floor_entities:
+        - sensor.dining_room_bdl_temperature
+        - sensor.foyer_bdl_temperature
+        - sensor.kitchen_bdl_temperature
+        - sensor.living_room_bdl_temperature
+        - sensor.powder_room_bdl_temperature
+      k_init: 5.0
+      max_run_min: 240
+    - name: basement_bunk_rooms
+      climate: climate.basement_bunk_rooms
+      return_entity: sensor.thermux_basement_return
+      k_init: 5.0
+      max_run_min: 240
+    - name: master_bedroom
+      climate: climate.master_bedroom
+      return_entity: sensor.thermux_master_return
+      floor_entities:
+        - sensor.master_bedroom_bdl_temperature
+        - sensor.master_bedroom_closet_bdl_temperature
+        - sensor.master_bathroom_bdl_temperature
+      k_init: 1.2
+      max_run_min: 120
+    - name: basement_master
+      climate: climate.basement_master
+      return_entity: sensor.thermux_basement_master_return_ada
+      k_init: 1.0
+      max_run_min: 120
+    - name: ski_room
+      climate: climate.ski_room
+      return_entity: sensor.thermux_ski_room_return
+      floor_entities:
+        - sensor.ski_room_bdl_temperature
+      k_init: 0.6
+      max_run_min: 120
+
+  mqtt_enabled: true
+  mqtt_host: 192.168.10.212
+  mqtt_port: 1883
+  mqtt_username: arctic_sniffer
+  mqtt_password: !secret arctic_mqtt_password
+  mqtt_discovery_prefix: homeassistant

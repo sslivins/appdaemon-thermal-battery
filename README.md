@@ -41,6 +41,12 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
     k     += learn_alpha * (needed / actual_HDH - k)   (±max_step_frac/day)
     ```
   - Actual HDH comes from Open-Meteo's analysis for the past hours.
+  - Sun on the glass is logged too, but not used yet. It is Open-Meteo's
+    `global_tilted_irradiance` on a plane facing `weather.window_azimuth`
+    (compass, default 202.5° SSW) at `window_tilt` (90 = vertical). This
+    accounts for sun angle, day length and cloud. Each cycle stores
+    `plan_solar` and `actual_solar` (kWh/m²) for a future
+    `budget = k·HDH − s·sun` fit.
   - Learning is skipped on mild days, partial cycles, home mode, or manual
     setpoint changes.
   - If a zone couldn't deliver its budget (it hit max run or the window end),

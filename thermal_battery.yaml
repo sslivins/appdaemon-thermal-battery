@@ -45,6 +45,8 @@ thermal_battery:
     latitude: 50.8846
     longitude: -119.8633
     elevation: 1315
+    window_azimuth: 202.5   # compass bearing the main glass faces (SSW)
+    window_tilt: 90         # vertical windows
     refresh_min: 30
     stale_hours: 3          # scream if no good fetch for this long
 

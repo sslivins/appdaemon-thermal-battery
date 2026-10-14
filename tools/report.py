@@ -35,8 +35,8 @@ def main():
     wok = kv("weather_ok_ts") or 0
     print("== Current cycle %s (partial=%s)" % (live.get("cycle_id"),
                                                 live.get("partial")))
-    print("   plan HDH=%s window=%s-%s (%s C)%s" % (
-        live.get("plan_hdh"), _fmt(live.get("window_start")),
+    print("   plan HDH=%s sun=%s kWh/m2 window=%s-%s (%s C)%s" % (
+        live.get("plan_hdh"), live.get("plan_solar"), _fmt(live.get("window_start")),
         _fmt(live.get("window_end")), live.get("window_mean_c"),
         "  PLAN ERROR: %s" % live["plan_error"] if live.get("plan_error")
         else ""))
@@ -50,16 +50,16 @@ def main():
                  if z.get("invalid") else ""))
 
     print("\n== Graded cycles since %s" % since)
-    print("   %-10s %-20s %6s %6s %7s %7s %7s %5s %5s %13s  %s" % (
-        "cycle", "zone", "planH", "actH", "budget", "deliv", "unpl",
+    print("   %-10s %-20s %6s %6s %5s %5s %7s %7s %7s %5s %5s %13s  %s" % (
+        "cycle", "zone", "planH", "actH", "pSun", "aSun", "budget", "deliv", "unpl",
         "low", "floor", "k", "reason"))
     for r in db.execute(
-            "SELECT cycle_id, zone, plan_hdh, actual_hdh, budget, delivered,"
+            "SELECT cycle_id, zone, plan_hdh, actual_hdh, plan_solar, actual_solar, budget, delivered,"
             " unplanned, morning_low, floor_low, k_before, k_after, reason"
             " FROM cycles WHERE cycle_id>=? ORDER BY cycle_id, rowid",
             (since,)):
         c = ["-" if v is None else v for v in r]
-        print("   %-10s %-20s %6s %6s %7s %7s %7s %5s %5s %6s>%-6s  %s"
+        print("   %-10s %-20s %6s %6s %5s %5s %7s %7s %7s %5s %5s %6s>%-6s  %s"
               % tuple(c))
 
     print("\n== k values (learned; zones not listed are still at k_init)")

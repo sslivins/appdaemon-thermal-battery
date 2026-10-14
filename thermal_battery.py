@@ -126,6 +126,10 @@ class ThermalBattery(hass.Hass):
         self.elev = w.get("elevation", 1315)
         self.weather_refresh_min = float(w.get("refresh_min", 30))
         self.weather_stale_h = float(w.get("stale_hours", 3))
+        # Sun on the glass: irradiance on a vertical plane facing the main
+        # windows (compass bearing; Open-Meteo wants 0=S, -90=E, +90=W).
+        self.solar_azimuth = float(w.get("window_azimuth", 202.5)) - 180.0
+        self.solar_tilt = float(w.get("window_tilt", 90))
 
         self.notify_services = list(a.get("notify_services", []) or [])
         # Push via another HA instance's REST API (e.g. the home HA that has
@@ -237,6 +241,13 @@ class ThermalBattery(hass.Hass):
                       " morning_low REAL, floor_low REAL, k_before REAL,"
                       " k_after REAL, learned INTEGER, reason TEXT,"
                       " detail TEXT, PRIMARY KEY(cycle_id, zone))")
+            for tbl, col in (("weather_hourly", "gti REAL"),
+                             ("cycles", "plan_solar REAL"),
+                             ("cycles", "actual_solar REAL")):
+                try:
+                    c.execute("ALTER TABLE %s ADD COLUMN %s" % (tbl, col))
+                except sqlite3.OperationalError:
+                    pass  # already there
             c.commit()
 
     def _kv_get(self, key):
@@ -337,7 +348,9 @@ class ThermalBattery(hass.Hass):
         params = {
             "latitude": self.lat, "longitude": self.lon,
             "elevation": self.elev,
-            "hourly": "temperature_2m,cloud_cover,shortwave_radiation",
+            "hourly": "temperature_2m,cloud_cover,shortwave_radiation,"
+                      "global_tilted_irradiance",
+            "tilt": self.solar_tilt, "azimuth": self.solar_azimuth,
             "past_days": 3, "forecast_days": 3,
             "timezone": "UTC", "timeformat": "unixtime",
         }
@@ -348,6 +361,7 @@ class ThermalBattery(hass.Hass):
             ts, temp = h["time"], h["temperature_2m"]
             cloud = h.get("cloud_cover") or [None] * len(ts)
             sw = h.get("shortwave_radiation") or [None] * len(ts)
+            gti = h.get("global_tilted_irradiance") or [None] * len(ts)
             if not ts or len(temp) != len(ts):
                 raise ValueError("malformed hourly payload")
             now = time.time()
@@ -357,12 +371,13 @@ class ThermalBattery(hass.Hass):
                 raise ValueError("only %d valid forecast hours ahead"
                                  % len(ahead))
             fetched = int(now)
-            rows = [(int(t), _num(v), _num(c), _num(s), fetched)
-                    for t, v, c, s in zip(ts, temp, cloud, sw)
+            rows = [(int(t), _num(v), _num(c), _num(s), fetched, _num(g))
+                    for t, v, c, s, g in zip(ts, temp, cloud, sw, gti)
                     if v is not None]
             with self._db_lock:
                 self._db.executemany(
-                    "INSERT OR REPLACE INTO weather_hourly VALUES (?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO weather_hourly (hour_ts, temp,"
+                    " cloud, sw, fetched_ts, gti) VALUES (?,?,?,?,?,?)",
                     rows)
                 self._db.commit()
             self.weather_ok_ts = fetched
@@ -407,7 +422,18 @@ class ThermalBattery(hass.Hass):
             expected / float(len(rows)))
         return hdh, rows
 
-    # =============================================================== cycle ==
+    def _solar(self, start_dt, end_dt):
+        """Sun on the window plane over the period, kWh/m2 (None if missing)."""
+        with self._db_lock:
+            vals = [r[0] for r in self._db.execute(
+                "SELECT gti FROM weather_hourly WHERE hour_ts>=? AND"
+                " hour_ts<?", (int(start_dt.timestamp()),
+                               int(end_dt.timestamp())))]
+        expected = int(round((end_dt - start_dt).total_seconds() / 3600))
+        vals = [v for v in vals if v is not None]
+        if len(vals) < expected - 2:
+            return None
+        return round(sum(vals) / 1000.0 * expected / float(len(vals)), 2)
     def _new_live(self, cycle_start, partial):
         return {
             "cycle_id": cycle_start.strftime("%Y-%m-%d"),
@@ -483,6 +509,7 @@ class ThermalBattery(hass.Hass):
         ws = best[1] if best else self._at(day, self.window_earliest)
         we = ws + dt.timedelta(hours=self.window_hours)
         live["plan_hdh"] = round(hdh, 1)
+        live["plan_solar"] = self._solar(cs, ce)
         live["plan_error"] = None
         live["window_start"] = ws.timestamp()
         live["window_end"] = we.timestamp()
@@ -494,8 +521,9 @@ class ThermalBattery(hass.Hass):
             zs["budget"] = round(min(k * hdh, z["max_budget"]), 1)
         self._save_live()
         self._set_problem("plan", False)
-        self._event(None, "plan", "%s HDH=%.1f window=%s-%s (%.1fC) budgets=%s%s"
-                    % (live["cycle_id"], hdh, ws.strftime("%H:%M"),
+        self._event(None, "plan", "%s HDH=%.1f sun=%s kWh/m2 window=%s-%s (%.1fC) budgets=%s%s"
+                    % (live["cycle_id"], hdh, live.get("plan_solar"),
+                       ws.strftime("%H:%M"),
                        we.strftime("%H:%M"), live.get("window_mean_c") or 0,
                        {n: s["budget"] for n, s in live["zones"].items()},
                        " (retry)" if retry else ""))
@@ -512,6 +540,7 @@ class ThermalBattery(hass.Hass):
             if zs.get("session"):
                 self._end_session(name, "grade", restore=True)
         actual_hdh, _ = self._hdh(cs, ce)
+        actual_solar = self._solar(cs, ce)
         night_start = self._at(cs, self.night_start)
         summary = []
         for z in self.zones:
@@ -573,14 +602,18 @@ class ThermalBattery(hass.Hass):
                 "dry_run": self.dry_run, "coverage": round(coverage, 2)}
             with self._db_lock:
                 self._db.execute(
-                    "INSERT OR REPLACE INTO cycles VALUES"
-                    " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO cycles (cycle_id, zone, plan_hdh,"
+                    " actual_hdh, budget, delivered, unplanned, needed,"
+                    " morning_low, floor_low, k_before, k_after, learned,"
+                    " reason, detail, plan_solar, actual_solar) VALUES"
+                    " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (live["cycle_id"], name, live.get("plan_hdh"),
                      None if actual_hdh is None else round(actual_hdh, 1),
                      zs.get("budget"), round(delivered, 1),
                      round(unplanned, 1), round(needed, 1), low, floor_low,
                      round(k_before, 4), round(k_after, 4), int(learned),
-                     reason, json.dumps(detail)))
+                     reason, json.dumps(detail), live.get("plan_solar"),
+                     actual_solar))
                 self._db.commit()
             summary.append("%s: deliv=%.0f unpl=%.0f (%.0fmin) low=%s k %.3f->%.3f (%s)"
                            % (name, delivered, unplanned, unplanned_min, low,
@@ -593,9 +626,9 @@ class ThermalBattery(hass.Hass):
                                     "actual_hdh": actual_hdh,
                                     "zones": {n: s.get("last_grade") for n, s
                                               in live["zones"].items()}})
-        self._event(None, "grade", "%s actualHDH=%s | %s" % (
+        self._event(None, "grade", "%s actualHDH=%s sun=%s | %s" % (
             live["cycle_id"], None if actual_hdh is None else
-            round(actual_hdh, 1), " | ".join(summary)))
+            round(actual_hdh, 1), actual_solar, " | ".join(summary)))
         self._prune()
 
     def _night_low(self, zone, start, end):
@@ -1032,6 +1065,7 @@ class ThermalBattery(hass.Hass):
         self._pub(b + "/status/attr", {
             "cycle_id": live["cycle_id"], "partial": live.get("partial"),
             "plan_hdh": live.get("plan_hdh"),
+            "plan_solar_kwh_m2": live.get("plan_solar"),
             "plan_error": live.get("plan_error"),
             "window_start": fmt(live.get("window_start")),
             "window_end": fmt(live.get("window_end")),

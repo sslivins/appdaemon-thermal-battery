@@ -543,6 +543,10 @@ class ThermalBattery(hass.Hass):
                                                     self.min_learn_hdh))
             if coverage < self.min_sample_coverage:
                 reasons.append("night samples %.0f%%" % (coverage * 100))
+            if overshoot and delivered < self.unplanned_eps:
+                # We added nothing and the house stayed warm: it is coasting
+                # on stored/solar heat. No information about k - don't learn.
+                reasons.append("coasting (no heat added, low %.1f)" % low)
             learned = not reasons
             capacity_limited = zs.get("stop_reason") in ("max run",
                                                           "window end")

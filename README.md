@@ -72,7 +72,10 @@ These conditions raise an HA persistent notification, set
 - a failed plan
 - a crashed tick
 
-They auto-clear on recovery. `remote_notify` also pushes each problem and recovery to a phone through another HA instance's REST API (here the home HA's `notify.mobile_app_stefan`; its token is `mi_ha_notify_token` in `secrets.yaml`, and adding a new secret needs an AppDaemon restart). To test it, fire the HA event `thermal_battery_test_notify`. Weather problems also set
+They auto-clear on recovery. A condition only alerts once it has lasted
+`problem_confirm_s` (default 120 s) and the app has been up for
+`startup_grace_s` (default 300 s), so HA restarts and brief sensor blips stay
+quiet. `remote_notify` also pushes each problem and recovery to a phone through another HA instance's REST API (here the home HA's `notify.mobile_app_stefan`; its token is `mi_ha_notify_token` in `secrets.yaml`, and adding a new secret needs an AppDaemon restart). To test it, fire the HA event `thermal_battery_test_notify`. Weather problems also set
 `binary_sensor.thermal_battery_weather_problem`. The MQTT availability topic
 has a last will, so the entities go `unavailable` if the app dies.
 

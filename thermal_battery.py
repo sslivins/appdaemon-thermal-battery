@@ -166,6 +166,12 @@ class ThermalBattery(hass.Hass):
         self.live = self._kv_get("live")
         self.weather_ok_ts = (self._kv_get("weather_ok_ts") or 0)
         self._problems = {}
+        self._pending = {}
+        self._t_start = time.time()
+        # A problem must persist this long before it alerts, longer just
+        # after startup (e.g. HA restart: ESPHome sensors reconnect late).
+        self.problem_confirm_s = float(a.get("problem_confirm_s", 120))
+        self.startup_grace_s = float(a.get("startup_grace_s", 300))
         self._last_tick = None
         self._last_sample = 0
         self._backup_clear_since = None
@@ -911,6 +917,13 @@ class ThermalBattery(hass.Hass):
             if key in self._problems:
                 self._problems[key] = message
                 return
+            now = time.time()
+            first = self._pending.setdefault(key, now)
+            hold = max(self.problem_confirm_s,
+                       self._t_start + self.startup_grace_s - first)
+            if now - first < hold:
+                return
+            self._pending.pop(key, None)
             self._problems[key] = message
             self.log("PROBLEM [%s]: %s" % (key, message), level="ERROR")
             try:
@@ -928,6 +941,9 @@ class ThermalBattery(hass.Hass):
                              level="ERROR")
             self._push("Thermal Battery problem", message)
             self._publish_status()
+        elif self._pending.pop(key, None) is not None:
+            self.log("transient [%s] cleared before alerting" % key,
+                     level="DEBUG")
         elif key in self._problems:
             del self._problems[key]
             self.log("RECOVERED [%s]" % key, level="WARNING")

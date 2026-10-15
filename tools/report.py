@@ -17,6 +17,43 @@ def _fmt(ts, f="%H:%M"):
     return dt.datetime.fromtimestamp(ts).strftime(f) if ts else "-"
 
 
+def _predictions(db, since):
+    try:
+        rows = db.execute(
+            "SELECT cycle_id, zone, issued_ts, kind, t0, pred_low,"
+            " persist_low, actual_low, valid, plausible FROM predictions"
+            " WHERE cycle_id>=? ORDER BY cycle_id, zone, issued_ts",
+            (since,)).fetchall()
+    except sqlite3.OperationalError:
+        return
+    print("\n== Shadow no-heat morning-low predictions since %s" % since)
+    print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s  %s" % (
+        "cycle", "zone", "at", "kind", "now", "pred", "last", "act", "note"))
+    err = {}
+    for cid, zone, ts, kind, t0, pred, persist, act, valid, ok in rows:
+        note = []
+        if not ok:
+            note.append("implausible")
+        if act is not None and not valid:
+            note.append("heated")
+        print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s  %s" % (
+            cid, zone, _fmt(ts), kind, _r(t0), _r(pred), _r(persist),
+            _r(act), " ".join(note)))
+        if valid and act is not None and persist is not None:
+            e = err.setdefault((zone, kind), [])
+            e.append((abs(pred - act), abs(persist - act)))
+    if err:
+        print("   MAE on valid (no-heat) nights: model vs persistence")
+        for (zone, kind), e in sorted(err.items()):
+            print("   %-20s %-6s n=%-3d model %.2f  persist %.2f" % (
+                zone, kind, len(e), sum(x[0] for x in e) / len(e),
+                sum(x[1] for x in e) / len(e)))
+
+
+def _r(v):
+    return "-" if v is None else "%.1f" % v
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=3)
@@ -65,6 +102,8 @@ def main():
     print("\n== k values (learned; zones not listed are still at k_init)")
     for z, k, upd in db.execute("SELECT zone, k, updated FROM k_values"):
         print("   %-20s %.3f  (%s)" % (z, k, upd[:16]))
+
+    _predictions(db, since)
 
     cutoff = int((dt.datetime.now() - dt.timedelta(days=1)).timestamp())
     print("\n== Events (last 24 h)")

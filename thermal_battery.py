@@ -44,6 +44,8 @@ from zoneinfo import ZoneInfo
 import appdaemon.plugins.hass.hassapi as hass
 import requests
 
+import tb_model
+
 try:
     import paho.mqtt.client as mqtt
 except ImportError:  # pragma: no cover
@@ -132,6 +134,18 @@ class ThermalBattery(hass.Hass):
         self.solar_tilt = float(w.get("window_tilt", 90))
 
         self.notify_services = list(a.get("notify_services", []) or [])
+        self.lux_entity = a.get("lux_entity")
+
+        # Shadow predictor (logs predicted vs actual morning lows; does not
+        # affect the plan).
+        p = a.get("predict", {}) or {}
+        self.predict_enabled = bool(p.get("enabled", True))
+        self.predict_times = [_hhmm(x) for x in (p.get("times") or [
+            "12:00", "15:00", "18:00"])]
+        self.predict_train_days = float(p.get("train_days", 21))
+        self.predict_min_days = float(p.get("min_train_days", 3))
+        self.predict_lambda = float(p.get("ridge_lambda", 0.05))
+        self.morning_hours = float(p.get("morning_hours", 6))
         # Push via another HA instance's REST API (e.g. the home HA that has
         # the phone's mobile_app): [{url, token, service}]
         self.remote_notify = [r for r in (a.get("remote_notify") or [])
@@ -145,6 +159,7 @@ class ThermalBattery(hass.Hass):
                 "climate": z["climate"],
                 "return_entity": z["return_entity"],
                 "floor_entities": list(z.get("floor_entities", []) or []),
+                "covers": list(z.get("covers", []) or []),
                 "k_init": float(z.get("k_init", 2.0)),
                 "k_min": float(z.get("k_min", 0.0)),
                 "k_max": float(z.get("k_max", 50.0)),
@@ -203,6 +218,8 @@ class ThermalBattery(hass.Hass):
         self.run_every(self._refresh_weather, "now+%d" % int(
             self.weather_refresh_min * 60), int(self.weather_refresh_min * 60))
         self.run_daily(self._on_grade_time, self.grade_time)
+        for t in self.predict_times:
+            self.run_daily(self._on_predict_time, t)
         self.run_every(self._watchdog, "now+60", 300)
         self.listen_event(self._on_test_notify, "thermal_battery_test_notify")
 
@@ -248,12 +265,26 @@ class ThermalBattery(hass.Hass):
                       " k_after REAL, learned INTEGER, reason TEXT,"
                       " detail TEXT, PRIMARY KEY(cycle_id, zone))")
             for tbl, col in (("weather_hourly", "gti REAL"),
+                             ("weather_hourly", "wind REAL"),
+                             ("samples", "blinds REAL"),
+                             ("samples", "lux REAL"),
+                             ("samples", "away INTEGER"),
                              ("cycles", "plan_solar REAL"),
                              ("cycles", "actual_solar REAL")):
                 try:
                     c.execute("ALTER TABLE %s ADD COLUMN %s" % (tbl, col))
                 except sqlite3.OperationalError:
                     pass  # already there
+            # Forecast as issued (weather_hourly is overwritten by later
+            # fetches/analysis, so it can't tell us what we knew at the time).
+            c.execute("CREATE TABLE IF NOT EXISTS forecast_snap (issued_ts"
+                      " INTEGER, hour_ts INTEGER, temp REAL, cloud REAL,"
+                      " gti REAL, wind REAL, PRIMARY KEY(issued_ts, hour_ts))")
+            c.execute("CREATE TABLE IF NOT EXISTS predictions (cycle_id TEXT,"
+                      " zone TEXT, issued_ts INTEGER, kind TEXT, t0 REAL,"
+                      " pred_low REAL, persist_low REAL, actual_low REAL,"
+                      " valid INTEGER, n_train INTEGER, plausible INTEGER,"
+                      " coef TEXT, PRIMARY KEY(cycle_id, zone, issued_ts))")
             c.commit()
 
     def _kv_get(self, key):
@@ -340,6 +371,18 @@ class ThermalBattery(hass.Hass):
         vals = [v for v in vals if v is not None]
         return round(sum(vals) / len(vals), 2) if vals else None
 
+    def _blinds(self, z):
+        """Mean open fraction of the zone's covers (1 = fully open)."""
+        vals = []
+        for e in z["covers"]:
+            st = self.get_state(e, attribute="all") or {}
+            pos = _num((st.get("attributes") or {}).get("current_position"))
+            if pos is not None:
+                vals.append(pos / 100.0)
+            elif st.get("state") in ("open", "closed"):
+                vals.append(1.0 if st["state"] == "open" else 0.0)
+        return round(sum(vals) / len(vals), 2) if vals else None
+
     def _apply(self, z, temp, why):
         if self.dry_run:
             self.log("[dry_run] would set %s -> %.1fC (%s)" % (
@@ -355,7 +398,7 @@ class ThermalBattery(hass.Hass):
             "latitude": self.lat, "longitude": self.lon,
             "elevation": self.elev,
             "hourly": "temperature_2m,cloud_cover,shortwave_radiation,"
-                      "global_tilted_irradiance",
+                      "global_tilted_irradiance,wind_speed_10m",
             "tilt": self.solar_tilt, "azimuth": self.solar_azimuth,
             "past_days": 3, "forecast_days": 3,
             "timezone": "UTC", "timeformat": "unixtime",
@@ -368,6 +411,7 @@ class ThermalBattery(hass.Hass):
             cloud = h.get("cloud_cover") or [None] * len(ts)
             sw = h.get("shortwave_radiation") or [None] * len(ts)
             gti = h.get("global_tilted_irradiance") or [None] * len(ts)
+            wind = h.get("wind_speed_10m") or [None] * len(ts)
             if not ts or len(temp) != len(ts):
                 raise ValueError("malformed hourly payload")
             now = time.time()
@@ -377,14 +421,21 @@ class ThermalBattery(hass.Hass):
                 raise ValueError("only %d valid forecast hours ahead"
                                  % len(ahead))
             fetched = int(now)
-            rows = [(int(t), _num(v), _num(c), _num(s), fetched, _num(g))
-                    for t, v, c, s, g in zip(ts, temp, cloud, sw, gti)
+            rows = [(int(t), _num(v), _num(c), _num(s), fetched, _num(g),
+                     _num(wd))
+                    for t, v, c, s, g, wd in zip(ts, temp, cloud, sw, gti,
+                                                 wind)
                     if v is not None]
+            snap = [(fetched, r[0], r[1], r[2], r[5], r[6]) for r in rows
+                    if now - 3600 <= r[0] < now + 30 * 3600]
             with self._db_lock:
                 self._db.executemany(
                     "INSERT OR REPLACE INTO weather_hourly (hour_ts, temp,"
-                    " cloud, sw, fetched_ts, gti) VALUES (?,?,?,?,?,?)",
-                    rows)
+                    " cloud, sw, fetched_ts, gti, wind) VALUES"
+                    " (?,?,?,?,?,?,?)", rows)
+                self._db.executemany(
+                    "INSERT OR REPLACE INTO forecast_snap VALUES"
+                    " (?,?,?,?,?,?)", snap)
                 self._db.commit()
             self.weather_ok_ts = fetched
             self._kv_set("weather_ok_ts", fetched)
@@ -482,6 +533,10 @@ class ThermalBattery(hass.Hass):
         self._grade()
         self.live = self._new_live(cs, partial=False)
         self._make_plan()
+        self._predict("plan")
+
+    def _on_predict_time(self, kwargs):
+        self._predict("replan")
 
     def _make_plan(self, retry=False):
         live = self.live
@@ -533,6 +588,121 @@ class ThermalBattery(hass.Hass):
                        we.strftime("%H:%M"), live.get("window_mean_c") or 0,
                        {n: s["budget"] for n, s in live["zones"].items()},
                        " (retry)" if retry else ""))
+
+    # ========================================================== predictor ==
+    def _zone_steps(self, name, start_ts, end_ts):
+        with self._db_lock:
+            samples = self._db.execute(
+                "SELECT ts, air, calling, supply, ret, away FROM samples"
+                " WHERE zone=? AND ts>=? AND ts<? ORDER BY ts",
+                (name, int(start_ts), int(end_ts))).fetchall()
+            weather = self._db.execute(
+                "SELECT hour_ts, temp, gti FROM weather_hourly WHERE"
+                " hour_ts>=? AND hour_ts<? ORDER BY hour_ts",
+                (int(start_ts) - 7200, int(end_ts) + 7200)).fetchall()
+        return tb_model.build_steps(samples, weather, start_ts, end_ts,
+                                    self.sample_s / 60.0)
+
+    def _predict(self, kind):
+        """Shadow only: predict each zone's no-heat morning low and log it."""
+        if not self.predict_enabled or not self.live:
+            return
+        try:
+            self._predict_inner(kind)
+        except Exception as exc:  # noqa: BLE001
+            self.log("predict failed: %s" % exc, level="WARNING")
+
+    def _predict_inner(self, kind):
+        live = self.live
+        now = time.time()
+        cs = live["cycle_start"]
+        ce = cs + 86400
+        m0 = ce - self.morning_hours * 3600
+        if now >= m0:
+            return
+        step = tb_model.STEP
+        t_now = int(now // step * step)
+        parts = []
+        for z in self.zones:
+            name = z["name"]
+            hist = self._zone_steps(
+                name, now - self.predict_train_days * 86400, t_now)
+            S, H, M = tb_model.filter_memory(hist)
+            days = sum(1 for r in hist if r["T"] is not None) * step / 86400.0
+            if days < self.predict_min_days or not hist or hist[-1]["T"] is None:
+                parts.append("%s: training (%.1f d)" % (name, days))
+                continue
+            coef, n = tb_model.fit(hist, self.predict_lambda)
+            if coef is None:
+                parts.append("%s: no fit" % name)
+                continue
+            ok = tb_model.plausible(coef)
+            persist = tb_model.robust_low(
+                hist, cs - self.morning_hours * 3600, cs)
+            future = tb_model.build_steps(
+                [], self._weather_rows(t_now, ce), t_now, ce)
+            tb_model.filter_memory(future, S, H)
+            T0 = hist[-1]["T"]
+            sim = tb_model.simulate(coef, T0, future, M)
+            lows = [T for T, r in zip(sim, future) if m0 <= r["t"] < ce]
+            if not lows or any(r["Tout"] is None for r in future):
+                parts.append("%s: no forecast" % name)
+                continue
+            pred = round(min(lows), 2)
+            live["zones"][name]["pred_low"] = pred
+            with self._db_lock:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO predictions (cycle_id, zone,"
+                    " issued_ts, kind, t0, pred_low, persist_low, n_train,"
+                    " plausible, coef) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (live["cycle_id"], name, int(now), kind, T0, pred,
+                     persist, n, int(ok),
+                     json.dumps(dict(zip(tb_model.NAMES,
+                                         [round(c, 5) for c in coef])))))
+                self._db.commit()
+            parts.append("%s: %.1f (now %.1f, last %s)%s" % (
+                name, pred, T0, persist, "" if ok else " IMPLAUSIBLE"))
+        self._save_live()
+        self._event(None, "predict", "%s %s no-heat morning low | %s" % (
+            live["cycle_id"], kind, " | ".join(parts)))
+
+    def _weather_rows(self, start_ts, end_ts):
+        with self._db_lock:
+            return self._db.execute(
+                "SELECT hour_ts, temp, gti FROM weather_hourly WHERE"
+                " hour_ts>=? AND hour_ts<? ORDER BY hour_ts",
+                (int(start_ts) - 7200, int(end_ts) + 7200)).fetchall()
+
+    def _score_predictions(self, cycle_id, ce):
+        """Fill in actual morning lows; valid only if the zone got no heat
+        after the prediction (heat would floor or lift the low)."""
+        m0 = ce - self.morning_hours * 3600
+        with self._db_lock:
+            rows = self._db.execute(
+                "SELECT zone, issued_ts, kind, pred_low, persist_low FROM"
+                " predictions WHERE cycle_id=? ORDER BY issued_ts",
+                (cycle_id,)).fetchall()
+        actual = {}
+        out = {}
+        for zone, issued, kind, pred, persist in rows:
+            if zone not in actual:
+                actual[zone] = tb_model.robust_low(
+                    self._zone_steps(zone, m0, ce), m0, ce)
+            act = actual[zone]
+            with self._db_lock:
+                heated = self._db.execute(
+                    "SELECT COUNT(*) FROM samples WHERE zone=? AND ts>=? AND"
+                    " ts<? AND calling=1", (zone, issued, ce)).fetchone()[0]
+                valid = int(act is not None and heated == 0)
+                self._db.execute(
+                    "UPDATE predictions SET actual_low=?, valid=? WHERE"
+                    " cycle_id=? AND zone=? AND issued_ts=?",
+                    (act, valid, cycle_id, zone, issued))
+                self._db.commit()
+            if zone not in out and act is not None:
+                out[zone] = "%s pred %.1f act %.1f%s" % (
+                    zone, pred, act, "" if valid else " (heated)")
+        return list(out.values())
 
     # ============================================================== grade ==
     def _grade(self):
@@ -635,6 +805,14 @@ class ThermalBattery(hass.Hass):
         self._event(None, "grade", "%s actualHDH=%s sun=%s | %s" % (
             live["cycle_id"], None if actual_hdh is None else
             round(actual_hdh, 1), actual_solar, " | ".join(summary)))
+        try:
+            scored = self._score_predictions(live["cycle_id"],
+                                             ce.timestamp())
+            if scored:
+                self._event(None, "predict_score", "%s | %s" % (
+                    live["cycle_id"], " | ".join(scored)))
+        except Exception as exc:  # noqa: BLE001
+            self.log("prediction scoring failed: %s" % exc, level="WARNING")
         self._prune()
 
     def _night_low(self, zone, start, end):
@@ -655,6 +833,8 @@ class ThermalBattery(hass.Hass):
         with self._db_lock:
             self._db.execute("DELETE FROM samples WHERE ts<?", (cutoff,))
             self._db.execute("DELETE FROM weather_hourly WHERE hour_ts<?",
+                             (cutoff,))
+            self._db.execute("DELETE FROM forecast_snap WHERE issued_ts<?",
                              (cutoff,))
             self._db.commit()
 
@@ -697,6 +877,8 @@ class ThermalBattery(hass.Hass):
         do_sample = now - self._last_sample >= self.sample_s
         if do_sample:
             self._last_sample = now
+        lux = (_num(self.get_state(self.lux_entity))
+               if do_sample and self.lux_entity else None)
         samples = []
 
         for z in self.zones:
@@ -749,7 +931,8 @@ class ThermalBattery(hass.Hass):
             if do_sample:
                 samples.append((int(now), name, c["air"], self._floor(z),
                                 c["setpoint"], int(calling), sup, ret,
-                                int(bool(zs["session"]))))
+                                int(bool(zs["session"])), self._blinds(z),
+                                lux, int(away)))
 
         self._maybe_start_sessions(away, backup, now)
         self._stale_check(self.supply_entity, sup, sup_age, any_flow_long)
@@ -757,7 +940,9 @@ class ThermalBattery(hass.Hass):
         if samples:
             with self._db_lock:
                 self._db.executemany(
-                    "INSERT INTO samples VALUES (?,?,?,?,?,?,?,?,?)", samples)
+                    "INSERT INTO samples (ts, zone, air, floor, setpoint,"
+                    " calling, supply, ret, session, blinds, lux, away)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", samples)
                 self._db.commit()
         self._save_live()
         if do_sample:

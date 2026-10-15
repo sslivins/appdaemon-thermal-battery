@@ -59,6 +59,32 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
 charge, and it still learns `k` from the backstop-only heat, which is a good
 way to bootstrap the model.
 
+## Shadow predictor (`tb_model.py`)
+
+Logging only; it never changes a budget. At plan time and at
+`predict.times` (12:00, 15:00, 18:00), each zone predicts its **no-heat
+morning low**: the minimum of the 30-min median air temperatures in the last
+`morning_hours` of the cycle. Each zone is fitted by ridge regression on
+30-min steps from the last `train_days` days (pure Python, no numpy):
+
+```
+dT = loss·(Tout−T) + settle·(M−T) + sun·I + sun_mem·S + heat·q + heat_mem·H + d
+```
+
+- `I` is sun on the glass; `S` and `H` are slow (6 h) memories of sun and heat.
+- `M` is a latent mass temperature, a 24 h average of air temperature.
+  Sun lifts the air quickly, but the slab absorbs most of it. After sunset the
+  air drops fast back toward `M` and then flattens. The `settle` term
+  captures that drop, so it isn't read as loss to outdoors and extrapolated
+  all night.
+
+At grade time, each prediction is scored against the actual robust low and
+against persistence (last night's low). A prediction counts as valid only if
+the zone got no heat after it was issued. The predictor needs
+`min_train_days` (3) of samples first. Coefficients are response ratios, not
+physical values. Implausible fits (for example a negative loss) are logged
+and flagged.
+
 ## Screaming
 
 These conditions raise an HA persistent notification, set
@@ -92,8 +118,13 @@ has a last will, so the entities go `unavailable` if the app dies.
 
 SQLite `thermal_battery.db` in the app directory has these tables:
 
-- `samples`: 60 s air, floor, setpoint, call, supply and return per zone
-- `weather_hourly`
+- `samples`: 60 s air, floor, setpoint, call, supply and return per zone,
+  plus zone blinds open fraction (`covers`), outdoor lux (`lux_entity`) and
+  away flag
+- `weather_hourly`: latest temperature, cloud, sun and wind per hour
+  (overwritten as forecasts are replaced by analysis)
+- `forecast_snap`: the next 30 h of forecast as issued at each refresh
+- `predictions`: shadow predictor output and scores
 - `cycles`: one graded row per zone per day
 - `events`
 - `k_values`
@@ -116,4 +147,4 @@ Requires `requests` and `paho-mqtt` (both present in the AppDaemon image) and
 python3 ~/docker/appdaemon/conf/apps/thermal_battery/tools/report.py --days 3
 ```
 
-Shows the current plan and charge per zone, graded cycles (morning low, k change and reason), learned `k`, the last 24 h of events, and problems found in the log.
+Shows the current plan and charge per zone, graded cycles (morning low, k change and reason), learned `k`, shadow predictions with MAE vs persistence, the last 24 h of events, and problems found in the log.

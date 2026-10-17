@@ -45,6 +45,10 @@ thermal_battery:
     latitude: 50.8846
     longitude: -119.8633
     elevation: 1315
+    # Open-Meteo model. best_match resolves to GFS here; Environment Canada's
+    # HRDPS blend was ~0.5C closer at night vs the house/AECO/HP1 outdoor
+    # sensors (10-day check, Oct 2026).
+    model: gem_seamless
     window_azimuth: 202.5   # compass bearing the main glass faces (SSW)
     window_tilt: 90         # vertical windows
     refresh_min: 30

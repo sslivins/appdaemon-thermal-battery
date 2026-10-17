@@ -126,6 +126,7 @@ class ThermalBattery(hass.Hass):
         self.lat = float(w.get("latitude", 50.8846))
         self.lon = float(w.get("longitude", -119.8633))
         self.elev = w.get("elevation", 1315)
+        self.weather_model = w.get("model")
         self.weather_refresh_min = float(w.get("refresh_min", 30))
         self.weather_stale_h = float(w.get("stale_hours", 3))
         # Sun on the glass: irradiance on a vertical plane facing the main
@@ -403,6 +404,8 @@ class ThermalBattery(hass.Hass):
             "past_days": 3, "forecast_days": 3,
             "timezone": "UTC", "timeformat": "unixtime",
         }
+        if self.weather_model:
+            params["models"] = self.weather_model
         try:
             r = requests.get(OPEN_METEO_URL, params=params, timeout=25)
             r.raise_for_status()

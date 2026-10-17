@@ -49,8 +49,10 @@ def _interp(times, vals, t):
 
 
 def build_steps(samples, weather, start, end, sample_min=1.0):
-    """samples: [(ts, air, calling, supply, ret, away)] sorted by ts.
-    weather: [(hour_ts, temp, gti)] sorted. Steps cover [start, end)."""
+    """samples: [(ts, air, calling, supply, ret, away[, outdoor])] sorted by
+    ts. weather: [(hour_ts, temp, gti)] sorted. Steps cover [start, end).
+    Tout is the measured outdoor median when the step has >= 3 readings,
+    else the (forecast/analysis) weather value."""
     wt = [w[0] for w in weather]
     wT = [w[1] for w in weather]
     wI = [w[2] for w in weather]
@@ -62,6 +64,7 @@ def build_steps(samples, weather, start, end, sample_min=1.0):
         hi = bisect.bisect_left(stimes, t + STEP)
         chunk = samples[lo:hi]
         airs = [s[1] for s in chunk if s[1] is not None]
+        outs = [s[6] for s in chunk if len(s) > 6 and s[6] is not None]
         q = 0.0
         away = True
         for s in chunk:
@@ -73,7 +76,8 @@ def build_steps(samples, weather, start, end, sample_min=1.0):
         steps.append({
             "t": t,
             "T": _median(airs) if len(airs) >= 3 else None,
-            "Tout": _interp(wt, wT, t + STEP / 2),
+            "Tout": (_median(outs) if len(outs) >= 3
+                     else _interp(wt, wT, t + STEP / 2)),
             "I": (gti or 0.0) / 1000.0,
             "q": q / 100.0,
             "away": away,

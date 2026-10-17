@@ -136,6 +136,10 @@ class ThermalBattery(hass.Hass):
 
         self.notify_services = list(a.get("notify_services", []) or [])
         self.lux_entity = a.get("lux_entity")
+        # Outdoor probes; the coldest valid reading is used (sun or housing
+        # mass only ever reads warm).
+        self.outdoor_entities = list(a.get("outdoor_entities", []) or [])
+        self.min_outdoor_cov = float(a.get("min_outdoor_coverage", 0.9))
 
         # Shadow predictor (logs predicted vs actual morning lows; does not
         # affect the plan).
@@ -270,6 +274,7 @@ class ThermalBattery(hass.Hass):
                              ("samples", "blinds REAL"),
                              ("samples", "lux REAL"),
                              ("samples", "away INTEGER"),
+                             ("samples", "outdoor REAL"),
                              ("cycles", "plan_solar REAL"),
                              ("cycles", "actual_solar REAL")):
                 try:
@@ -366,6 +371,32 @@ class ThermalBattery(hass.Hass):
             "setpoint": _num(at.get("temperature")),
             "air": _num(at.get("current_temperature")),
         }
+
+    def _outdoor(self):
+        vals = [_num(self.get_state(e)) for e in self.outdoor_entities]
+        vals = [v for v in vals if v is not None and -50.0 < v < 50.0]
+        return round(min(vals), 2) if vals else None
+
+    def _measured_hourly(self, start_ts, end_ts):
+        """{hour_ts: mean measured outdoor temp} from samples."""
+        with self._db_lock:
+            rows = self._db.execute(
+                "SELECT ts, outdoor FROM samples WHERE zone=? AND ts>=? AND"
+                " ts<? AND outdoor IS NOT NULL",
+                (self.zones[0]["name"], int(start_ts),
+                 int(end_ts))).fetchall()
+        b = {}
+        for ts, v in rows:
+            b.setdefault(int(ts // 3600 * 3600), []).append(v)
+        return {h: sum(v) / len(v) for h, v in b.items()}
+
+    def _measured_hdh(self, start_dt, end_dt):
+        hrs = self._measured_hourly(start_dt.timestamp(), end_dt.timestamp())
+        expected = int(round((end_dt - start_dt).total_seconds() / 3600))
+        if not hrs or len(hrs) < self.min_outdoor_cov * expected:
+            return None
+        return sum(max(0.0, self.hdh_base - v) for v in hrs.values()) * (
+            expected / float(len(hrs)))
 
     def _floor(self, z):
         vals = [_num(self.get_state(e)) for e in z["floor_entities"]]
@@ -596,8 +627,8 @@ class ThermalBattery(hass.Hass):
     def _zone_steps(self, name, start_ts, end_ts):
         with self._db_lock:
             samples = self._db.execute(
-                "SELECT ts, air, calling, supply, ret, away FROM samples"
-                " WHERE zone=? AND ts>=? AND ts<? ORDER BY ts",
+                "SELECT ts, air, calling, supply, ret, away, outdoor FROM"
+                " samples WHERE zone=? AND ts>=? AND ts<? ORDER BY ts",
                 (name, int(start_ts), int(end_ts))).fetchall()
             weather = self._db.execute(
                 "SELECT hour_ts, temp, gti FROM weather_hourly WHERE"
@@ -718,7 +749,10 @@ class ThermalBattery(hass.Hass):
         for name, zs in live["zones"].items():
             if zs.get("session"):
                 self._end_session(name, "grade", restore=True)
-        actual_hdh, _ = self._hdh(cs, ce)
+        om_hdh, _ = self._hdh(cs, ce)
+        meas_hdh = self._measured_hdh(cs, ce)
+        actual_hdh = meas_hdh if meas_hdh is not None else om_hdh
+        hdh_src = "sensors" if meas_hdh is not None else "open-meteo"
         actual_solar = self._solar(cs, ce)
         night_start = self._at(cs, self.night_start)
         summary = []
@@ -778,7 +812,9 @@ class ThermalBattery(hass.Hass):
             detail = {"overshoot": overshoot, "stop_reason": zs.get(
                 "stop_reason"), "run_min": round(zs.get("run_min", 0), 1),
                 "unplanned_min": round(unplanned_min, 1),
-                "dry_run": self.dry_run, "coverage": round(coverage, 2)}
+                "dry_run": self.dry_run, "coverage": round(coverage, 2),
+                "hdh_src": hdh_src, "hdh_om": None if om_hdh is None
+                else round(om_hdh, 1)}
             with self._db_lock:
                 self._db.execute(
                     "INSERT OR REPLACE INTO cycles (cycle_id, zone, plan_hdh,"
@@ -805,9 +841,11 @@ class ThermalBattery(hass.Hass):
                                     "actual_hdh": actual_hdh,
                                     "zones": {n: s.get("last_grade") for n, s
                                               in live["zones"].items()}})
-        self._event(None, "grade", "%s actualHDH=%s sun=%s | %s" % (
+        self._event(None, "grade", "%s actualHDH=%s (%s; open-meteo %s)"
+                    " sun=%s | %s" % (
             live["cycle_id"], None if actual_hdh is None else
-            round(actual_hdh, 1), actual_solar, " | ".join(summary)))
+            round(actual_hdh, 1), hdh_src, None if om_hdh is None else
+            round(om_hdh, 1), actual_solar, " | ".join(summary)))
         try:
             scored = self._score_predictions(live["cycle_id"],
                                              ce.timestamp())
@@ -882,6 +920,7 @@ class ThermalBattery(hass.Hass):
             self._last_sample = now
         lux = (_num(self.get_state(self.lux_entity))
                if do_sample and self.lux_entity else None)
+        outdoor = self._outdoor() if do_sample else None
         samples = []
 
         for z in self.zones:
@@ -935,7 +974,7 @@ class ThermalBattery(hass.Hass):
                 samples.append((int(now), name, c["air"], self._floor(z),
                                 c["setpoint"], int(calling), sup, ret,
                                 int(bool(zs["session"])), self._blinds(z),
-                                lux, int(away)))
+                                lux, int(away), outdoor))
 
         self._maybe_start_sessions(away, backup, now)
         self._stale_check(self.supply_entity, sup, sup_age, any_flow_long)
@@ -944,8 +983,8 @@ class ThermalBattery(hass.Hass):
             with self._db_lock:
                 self._db.executemany(
                     "INSERT INTO samples (ts, zone, air, floor, setpoint,"
-                    " calling, supply, ret, session, blinds, lux, away)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", samples)
+                    " calling, supply, ret, session, blinds, lux, away,"
+                    " outdoor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", samples)
                 self._db.commit()
         self._save_live()
         if do_sample:

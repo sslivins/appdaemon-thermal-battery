@@ -40,7 +40,12 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
     needed = delivered + unplanned        (shrunk on overshoot)
     k     += learn_alpha * (needed / actual_HDH - k)   (±max_step_frac/day)
     ```
-  - Actual HDH comes from Open-Meteo's analysis for the past hours.
+  - Actual HDH comes from the measured outdoor temperature: the coldest of
+    `outdoor_entities`, logged every minute. If fewer than
+    `min_outdoor_coverage` (90%) of the hours have readings, it falls back to
+    Open-Meteo's analysis. The forecast (`weather.model`, default
+    `gem_seamless`) is still what plans; the report compares the 9am forecast
+    with the measured values.
   - Sun on the glass is logged too, but not used yet. It is Open-Meteo's
     `global_tilted_irradiance` on a plane facing `weather.window_azimuth`
     (compass, default 202.5° SSW) at `window_tilt` (90 = vertical). This
@@ -65,7 +70,8 @@ Logging only; it never changes a budget. At plan time and at
 `predict.times` (12:00, 15:00, 18:00), each zone predicts its **no-heat
 morning low**: the minimum of the 30-min median air temperatures in the last
 `morning_hours` of the cycle. Each zone is fitted by ridge regression on
-30-min steps from the last `train_days` days (pure Python, no numpy):
+30-min steps from the last `train_days` days (pure Python, no numpy). Past
+steps use the measured outdoor temperature; future steps use the forecast:
 
 ```
 dT = loss·(Tout−T) + settle·(M−T) + sun·I + sun_mem·S + heat·q + heat_mem·H + d
@@ -119,8 +125,8 @@ has a last will, so the entities go `unavailable` if the app dies.
 SQLite `thermal_battery.db` in the app directory has these tables:
 
 - `samples`: 60 s air, floor, setpoint, call, supply and return per zone,
-  plus zone blinds open fraction (`covers`), outdoor lux (`lux_entity`) and
-  away flag
+  plus zone blinds open fraction (`covers`), outdoor lux (`lux_entity`),
+  measured outdoor temperature (`outdoor_entities`) and away flag
 - `weather_hourly`: latest temperature, cloud, sun and wind per hour
   (overwritten as forecasts are replaced by analysis)
 - `forecast_snap`: the next 30 h of forecast as issued at each refresh

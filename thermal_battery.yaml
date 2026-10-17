@@ -62,6 +62,14 @@ thermal_battery:
 
   # Logged with every sample (context for the solar model).
   lux_entity: sensor.usl_environmental_illuminance_3
+  # Measured outdoor temp = the coldest of these (sun on a probe or a
+  # probe's housing mass only ever reads warm). Used for actual HDH at grade
+  # and predictor training; the forecast is still what plans. AECO/Generac
+  # probes are excluded (housing mass keeps them ~3C warm in the evening).
+  outdoor_entities:
+    - sensor.usl_environmental_temperature_3
+    - sensor.mechanical_room_macon_heat_pump_controller_fcec_hp_1_outdoor_temperature
+    - sensor.mechanical_room_macon_heat_pump_controller_e540_hp_2_outdoor_temperature
 
   # Shadow predictor: at plan time and these replan times, predict each zone's
   # no-heat morning low (min of 30-min medians in the last morning_hours of

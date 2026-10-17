@@ -50,6 +50,47 @@ def _predictions(db, since):
                 sum(x[1] for x in e) / len(e)))
 
 
+def _forecast_check(db, days):
+    """9am forecast as issued vs measured outdoor (samples.outdoor)."""
+    try:
+        zone = db.execute("SELECT zone FROM samples WHERE outdoor IS NOT"
+                          " NULL LIMIT 1").fetchone()
+        snaps = [r[0] for r in db.execute(
+            "SELECT DISTINCT issued_ts FROM forecast_snap ORDER BY 1")]
+    except sqlite3.OperationalError:
+        return
+    if not zone or not snaps:
+        return
+    print("\n== 9am forecast vs measured outdoor (fcst - measured)")
+    print("   %-10s %-5s %6s %6s %6s %8s %8s" % (
+        "day", "iss", "n_hr", "bias", "MAE", "HDHfcst", "HDHmeas"))
+    today = dt.date.today()
+    for d in range(days, -1, -1):
+        day = today - dt.timedelta(days=d)
+        t9 = dt.datetime.combine(day, dt.time(9)).timestamp()
+        iss = min(snaps, key=lambda s: abs(s - t9))
+        if abs(iss - t9) > 3600:
+            continue
+        fc = dict(db.execute("SELECT hour_ts, temp FROM forecast_snap WHERE"
+                             " issued_ts=?", (iss,)).fetchall())
+        b = {}
+        for ts, v in db.execute(
+                "SELECT ts, outdoor FROM samples WHERE zone=? AND ts>=? AND"
+                " ts<? AND outdoor IS NOT NULL", (zone[0], int(t9),
+                                                  int(t9) + 86400)):
+            b.setdefault(int(ts // 3600 * 3600), []).append(v)
+        hrs = [h for h in sorted(b) if h in fc and fc[h] is not None]
+        if not hrs:
+            continue
+        meas = {h: sum(b[h]) / len(b[h]) for h in hrs}
+        err = [fc[h] - meas[h] for h in hrs]
+        print("   %-10s %-5s %6d %+6.2f %6.2f %8.0f %8.0f" % (
+            day, _fmt(iss), len(hrs), sum(err) / len(err),
+            sum(abs(e) for e in err) / len(err),
+            sum(max(0, 15 - fc[h]) for h in hrs),
+            sum(max(0, 15 - meas[h]) for h in hrs)))
+
+
 def _r(v):
     return "-" if v is None else "%.1f" % v
 
@@ -104,6 +145,7 @@ def main():
         print("   %-20s %.3f  (%s)" % (z, k, upd[:16]))
 
     _predictions(db, since)
+    _forecast_check(db, a.days)
 
     cutoff = int((dt.datetime.now() - dt.timedelta(days=1)).timestamp())
     print("\n== Events (last 24 h)")

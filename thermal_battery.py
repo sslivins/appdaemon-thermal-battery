@@ -66,6 +66,10 @@ def _num(v):
     return f
 
 
+def _fmt_c(v):
+    return "?" if v is None else "%.1f\u00b0C" % v
+
+
 def _hhmm(s):
     return dt.datetime.strptime(str(s).strip(), "%H:%M").time()
 
@@ -156,6 +160,13 @@ class ThermalBattery(hass.Hass):
         self.remote_notify = [r for r in (a.get("remote_notify") or [])
                               if r.get("url") and r.get("token")
                               and r.get("service")]
+        # Push when a zone starts/stops calling for heat. hvac_action can
+        # flicker, so a change must hold for heat_notify_debounce_s.
+        self.heat_notify = bool(a.get("heat_notify", True))
+        self.heat_notify_debounce_s = float(
+            a.get("heat_notify_debounce_s", 90))
+        self._heat = {}
+        self._last_outdoor = None
 
         self.zones = []
         for i, z in enumerate(a.get("zones", [])):
@@ -921,6 +932,8 @@ class ThermalBattery(hass.Hass):
         lux = (_num(self.get_state(self.lux_entity))
                if do_sample and self.lux_entity else None)
         outdoor = self._outdoor() if do_sample else None
+        if outdoor is not None:
+            self._last_outdoor = outdoor
         samples = []
 
         for z in self.zones:
@@ -938,6 +951,9 @@ class ThermalBattery(hass.Hass):
                 zs["call_start"] = now
             elif not calling:
                 zs["call_start"] = None
+            if c["available"]:
+                self._heat_watch(name, calling, c["air"],
+                                 bool(zs["session"]), now)
             flow_long = bool(calling and now - zs["call_start"]
                              >= self.sensor_stale_min * 60)
             any_flow_long = any_flow_long or flow_long
@@ -989,6 +1005,45 @@ class ThermalBattery(hass.Hass):
         self._save_live()
         if do_sample:
             self._publish_all()
+
+    def _heat_watch(self, name, calling, air, planned, now):
+        """Debounced start/stop push per zone. The first observation after
+        startup only sets the baseline (no push)."""
+        h = self._heat.get(name)
+        if h is None:
+            self._heat[name] = {"on": calling, "pend": None, "start": now,
+                                "air0": air}
+            return
+        if calling == h["on"]:
+            h["pend"] = None
+            return
+        if h["pend"] is None:
+            h["pend"] = now
+        if now - h["pend"] < self.heat_notify_debounce_s:
+            return
+        at = h["pend"]
+        h["on"], h["pend"] = calling, None
+        label = name.replace("_", " ").capitalize()
+        out = ("" if self._last_outdoor is None
+               else ", outdoor %.1f\u00b0C" % self._last_outdoor)
+        if calling:
+            h.update(start=at, air0=air)
+            kind = "planned charge" if planned else "backstop"
+            msg = "%s started heating at %s (%s): air %s%s" % (
+                label, time.strftime("%H:%M", time.localtime(at)), kind,
+                _fmt_c(air), out)
+            title = "Heating on: " + label
+        else:
+            mins = int(round((at - h["start"]) / 60.0))
+            msg = "%s stopped heating at %s after %dh%02dm: air %s -> %s%s" \
+                  % (label, time.strftime("%H:%M", time.localtime(at)),
+                     mins // 60, mins % 60, _fmt_c(h["air0"]), _fmt_c(air),
+                     out)
+            title = "Heating off: " + label
+        self.log("heat notify: " + msg)
+        self._event(name, "heat_on" if calling else "heat_off", msg)
+        if self.heat_notify:
+            self._push(title, msg)
 
     def _invalidate(self, zs, reason):
         if reason not in zs["invalid"]:

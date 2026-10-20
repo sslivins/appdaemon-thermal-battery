@@ -111,6 +111,17 @@ quiet. `remote_notify` also pushes each problem and recovery to a phone through 
 `binary_sensor.thermal_battery_weather_problem`. The MQTT availability topic
 has a last will, so the entities go `unavailable` if the app dies.
 
+### Heating notifications
+
+With `heat_notify: true` (default), `remote_notify` also pushes when any zone
+starts or stops calling for heat. The message says whether it's a planned
+charge or the backstop, and gives the time, air temperature and measured
+outdoor temperature; the stop message adds the run time and the air
+temperature change. A change must hold for `heat_notify_debounce_s`
+(default 90 s), and the state seen at startup is only a baseline, so
+restarts don't send pushes. Each push is also logged as a
+`heat_on` / `heat_off` event.
+
 ## Entities (MQTT discovery)
 
 - `sensor.thermal_battery_status`: `dry_run` / `idle` / `charging` / `home`.

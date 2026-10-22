@@ -91,6 +91,15 @@ the zone got no heat after it was issued. The predictor needs
 physical values. Implausible fits (for example a negative loss) are logged
 and flagged.
 
+The logged prediction (`pred_low`) is a blend: `blend` (default 0.5) × the
+model plus the rest × last night's low. On its own the model over-reacts to a
+single milder or colder day, because the slab smooths those out. In a backtest
+over Oct 16–21 (forecasts as issued) the blend cut the 09:00 error from
+0.43 °C (model only) and 0.45 °C (last night's low only) to 0.25 °C. A
+longer mass memory (48–120 h), forecast bias correction and snapping to
+whole °F didn't help. The raw model output is kept in `model_low`, and the
+report shows all three.
+
 ## Screaming
 
 These conditions raise an HA persistent notification, set

@@ -81,6 +81,7 @@ thermal_battery:
     train_days: 21
     min_train_days: 3
     ridge_lambda: 0.05
+    blend: 0.5          # model weight vs last night's low (1 = model only)
     morning_hours: 6
   # Phone push via the home HA (BDL has no mobile_app). Test by firing the
   # HA event `thermal_battery_test_notify` on BDL.

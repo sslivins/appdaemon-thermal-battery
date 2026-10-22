@@ -21,33 +21,37 @@ def _predictions(db, since):
     try:
         rows = db.execute(
             "SELECT cycle_id, zone, issued_ts, kind, t0, pred_low,"
-            " persist_low, actual_low, valid, plausible FROM predictions"
+            " persist_low, actual_low, valid, plausible,"
+            " COALESCE(model_low, pred_low) FROM predictions"
             " WHERE cycle_id>=? ORDER BY cycle_id, zone, issued_ts",
             (since,)).fetchall()
     except sqlite3.OperationalError:
         return
     print("\n== Shadow no-heat morning-low predictions since %s" % since)
-    print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s  %s" % (
-        "cycle", "zone", "at", "kind", "now", "pred", "last", "act", "note"))
+    print("   (pred = blend of model and last night's low)")
+    print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s %5s  %s" % (
+        "cycle", "zone", "at", "kind", "now", "pred", "model", "last", "act",
+        "note"))
     err = {}
-    for cid, zone, ts, kind, t0, pred, persist, act, valid, ok in rows:
+    for cid, zone, ts, kind, t0, pred, persist, act, valid, ok, model in rows:
         note = []
         if not ok:
             note.append("implausible")
         if act is not None and not valid:
             note.append("heated")
-        print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s  %s" % (
-            cid, zone, _fmt(ts), kind, _r(t0), _r(pred), _r(persist),
-            _r(act), " ".join(note)))
+        print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s %5s  %s" % (
+            cid, zone, _fmt(ts), kind, _r(t0), _r(pred), _r(model),
+            _r(persist), _r(act), " ".join(note)))
         if valid and act is not None and persist is not None:
             e = err.setdefault((zone, kind), [])
-            e.append((abs(pred - act), abs(persist - act)))
+            e.append((abs(pred - act), abs(model - act), abs(persist - act)))
     if err:
-        print("   MAE on valid (no-heat) nights: model vs persistence")
+        print("   MAE on valid (no-heat) nights: pred vs model vs persistence")
         for (zone, kind), e in sorted(err.items()):
-            print("   %-20s %-6s n=%-3d model %.2f  persist %.2f" % (
-                zone, kind, len(e), sum(x[0] for x in e) / len(e),
-                sum(x[1] for x in e) / len(e)))
+            print("   %-20s %-6s n=%-3d pred %.2f  model %.2f  persist %.2f"
+                  % (zone, kind, len(e), sum(x[0] for x in e) / len(e),
+                     sum(x[1] for x in e) / len(e),
+                     sum(x[2] for x in e) / len(e)))
 
 
 def _forecast_check(db, days):

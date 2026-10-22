@@ -154,6 +154,10 @@ class ThermalBattery(hass.Hass):
         self.predict_train_days = float(p.get("train_days", 21))
         self.predict_min_days = float(p.get("min_train_days", 3))
         self.predict_lambda = float(p.get("ridge_lambda", 0.05))
+        # Weight of the model vs last night's low in the logged prediction
+        # (1 = model only). The model alone over-reacts to one-day weather
+        # swings; a 50/50 blend roughly halved the 09:00 error in backtest.
+        self.predict_blend = min(1.0, max(0.0, float(p.get("blend", 0.5))))
         self.morning_hours = float(p.get("morning_hours", 6))
         # Push via another HA instance's REST API (e.g. the home HA that has
         # the phone's mobile_app): [{url, token, service}]
@@ -302,6 +306,10 @@ class ThermalBattery(hass.Hass):
                       " pred_low REAL, persist_low REAL, actual_low REAL,"
                       " valid INTEGER, n_train INTEGER, plausible INTEGER,"
                       " coef TEXT, PRIMARY KEY(cycle_id, zone, issued_ts))")
+            try:  # raw model output; pred_low is the blend
+                c.execute("ALTER TABLE predictions ADD COLUMN model_low REAL")
+            except sqlite3.OperationalError:
+                pass
             c.commit()
 
     def _kv_get(self, key):
@@ -693,20 +701,23 @@ class ThermalBattery(hass.Hass):
             if not lows or any(r["Tout"] is None for r in future):
                 parts.append("%s: no forecast" % name)
                 continue
-            pred = round(min(lows), 2)
+            model = min(lows)
+            w = self.predict_blend if persist is not None else 1.0
+            pred = round(w * model + (1 - w) * (persist or 0.0), 2)
             live["zones"][name]["pred_low"] = pred
             with self._db_lock:
                 self._db.execute(
                     "INSERT OR REPLACE INTO predictions (cycle_id, zone,"
                     " issued_ts, kind, t0, pred_low, persist_low, n_train,"
-                    " plausible, coef) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    " plausible, coef, model_low) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (live["cycle_id"], name, int(now), kind, T0, pred,
                      persist, n, int(ok),
                      json.dumps(dict(zip(tb_model.NAMES,
-                                         [round(c, 5) for c in coef])))))
+                                         [round(c, 5) for c in coef]))),
+                     round(model, 2)))
                 self._db.commit()
-            parts.append("%s: %.1f (now %.1f, last %s)%s" % (
-                name, pred, T0, persist, "" if ok else " IMPLAUSIBLE"))
+            parts.append("%s: %.1f (model %.1f, now %.1f, last %s)%s" % (
+                name, pred, model, T0, persist, "" if ok else " IMPLAUSIBLE"))
         self._save_live()
         self._event(None, "predict", "%s %s no-heat morning low | %s" % (
             live["cycle_id"], kind, " | ".join(parts)))

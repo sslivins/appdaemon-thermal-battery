@@ -60,6 +60,33 @@ def _mae(e, i):
     return "%.2f" % (sum(v) / len(v)) if v else "  - "
 
 
+def _decisions(db, since):
+    try:
+        rows = db.execute(
+            "SELECT cycle_id, zone, issued_ts, target, slab_t, k_left,"
+            " slab_need, capped, low_none, low_with, added, hind_low,"
+            " actual_low FROM decisions WHERE cycle_id>=?"
+            " ORDER BY cycle_id, zone", (since,)).fetchall()
+    except sqlite3.OperationalError:
+        return
+    if not rows:
+        return
+    print("\n== Shadow charge decision at window open (slab model, C*min)")
+    print("   need = slab model's charge to keep the night low >= target;"
+          " k = k budget left")
+    print("   graded: added = heat actually delivered after; model = low"
+          " re-run with that heat")
+    print("   %-10s %-20s %-5s %5s %5s %6s %6s %5s %5s %6s %5s %5s" % (
+        "cycle", "zone", "at", "tgt", "Ts", "k", "need", "low0", "low1",
+        "added", "model", "act"))
+    for (cid, zone, ts, tgt, ts_, k, need, cap, l0, l1, add, hl,
+         act) in rows:
+        print("   %-10s %-20s %-5s %5s %5s %6.0f %6s %5s %5s %6s %5s %5s" % (
+            cid, zone, _fmt(ts), _r(tgt), _r(ts_), k or 0,
+            "%.0f%s" % (need, "!" if cap else ""), _r(l0), _r(l1),
+            "-" if add is None else "%.0f" % add, _r(hl), _r(act)))
+
+
 def _loop_calls(db, since):
     try:
         rows = db.execute(
@@ -184,6 +211,7 @@ def main():
         print("   %-20s %.3f  (%s)" % (z, k, upd[:16]))
 
     _predictions(db, since)
+    _decisions(db, since)
     _loop_calls(db, since)
     _forecast_check(db, a.days)
 

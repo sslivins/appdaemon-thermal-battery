@@ -389,3 +389,55 @@ def robust_low(steps, start, end):
     vals = [r["T"] for r in steps if start <= r["t"] < end
             and r["T"] is not None]
     return min(vals) if vals else None
+
+# ---------------------------------------------------------- decision ------
+def charge_rate(steps):
+    """Typical heat per step (C*min) while the zone calls for a whole step:
+    75th percentile of the steps that had any heat."""
+    v = sorted(r["q"] * 100.0 for r in steps if r["q"] > 0)
+    return v[int(0.75 * (len(v) - 1))] if len(v) >= 4 else None
+
+
+def charge_profile(steps, start, end, rate, Q):
+    """Copy of steps with Q (C*min) delivered from start at `rate` per step
+    until done or `end`."""
+    out = []
+    left = Q
+    for r in steps:
+        r = dict(r)
+        r["q"] = 0.0
+        if start <= r["t"] < end and left > 0:
+            d = min(rate, left)
+            r["q"] = d / 100.0
+            left -= d
+        out.append(r)
+    return out
+
+
+def required_charge(p, x, future, start, end, rate, cap, target, low_start,
+                    low_end, tol=10.0):
+    """Smallest charge Q (C*min, delivered from `start`) that keeps the
+    simulated air low over [low_start, low_end) at or above target.
+    -> (Q, low_without, low_with, capped) or None."""
+    def low(Q):
+        sim = simulate(p, x, charge_profile(future, start, end, rate, Q))
+        v = [a for (a, _), r in zip(sim, future)
+             if low_start <= r["t"] < low_end]
+        return min(v) if v else None
+
+    l0 = low(0.0)
+    if l0 is None:
+        return None
+    if l0 >= target:
+        return 0.0, l0, l0, False
+    lmax = low(cap)
+    if lmax < target:
+        return cap, l0, lmax, True
+    a, b = 0.0, cap
+    while b - a > tol:
+        m = 0.5 * (a + b)
+        if low(m) < target:
+            a = m
+        else:
+            b = m
+    return b, l0, low(b), False

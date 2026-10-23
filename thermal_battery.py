@@ -336,6 +336,17 @@ class ThermalBattery(hass.Hass):
                       " t0 INTEGER, dip REAL, t_dip REAL, t_front REAL,"
                       " plateau REAL, valid INTEGER,"
                       " PRIMARY KEY(zone, t0))")
+            # Shadow charge decision at window open (tb_slab): heat needed
+            # to keep the night low >= target_low vs the k budget left.
+            # Scored at grade by re-running the model from the stored state
+            # with the heat and weather that actually happened.
+            c.execute("CREATE TABLE IF NOT EXISTS decisions (cycle_id TEXT,"
+                      " zone TEXT, issued_ts INTEGER, target REAL,"
+                      " slab_t REAL, k_left REAL, slab_need REAL,"
+                      " capped INTEGER, low_none REAL, low_with REAL,"
+                      " rate REAL, state TEXT, params TEXT,"
+                      " added REAL, hind_low REAL, actual_low REAL,"
+                      " PRIMARY KEY(cycle_id, zone))")
             c.commit()
 
     def _kv_get(self, key):
@@ -779,6 +790,93 @@ class ThermalBattery(hass.Hass):
         lows = [a for (a, _), r in zip(sim, future) if m0 <= r["t"] < ce]
         return (min(lows), x[1]) if lows else None
 
+    def _slab_decide(self, now):
+        """Shadow: at window open, size each zone's charge with the slab
+        model (smallest charge keeping the night low >= target_low) and log
+        it next to the k budget still left. Never drives the thermostats."""
+        live = self.live
+        cs = dt.datetime.fromtimestamp(live["cycle_start"], self.tz)
+        ce = (cs + dt.timedelta(days=1)).timestamp()
+        ns = self._at(cs, self.night_start).timestamp()
+        we = live["window_end"]
+        step = tb_slab.STEP
+        t_now = int(now // step * step)
+        weather = self._weather_rows(t_now, ce)
+        parts = []
+        for z in self.zones:
+            name = z["name"]
+            zs = live["zones"][name]
+            p = (self._slab_params.get(name) or {}).get("p")
+            if not p:
+                parts.append("%s: no fit" % name)
+                continue
+            hist = self._slab_steps(
+                name, now - self.predict_train_days * 86400, t_now)
+            x, _, _, _ = tb_slab.kfilter(p, hist, z["air_coarse"])
+            future = tb_slab.build_steps([], weather, t_now, ce)
+            if x is None or any(r["Tout"] is None for r in future):
+                parts.append("%s: no state/forecast" % name)
+                continue
+            rate = tb_slab.charge_rate(hist) or 200.0
+            cap = min(rate * max(0.0, we - t_now) / step,
+                      rate * z["max_run_min"] * 60 / step)
+            res = tb_slab.required_charge(p, x, future, t_now, we, rate, cap,
+                                          self.target_low, ns, ce)
+            if res is None:
+                parts.append("%s: no night steps" % name)
+                continue
+            need, l0, l1, capped = res
+            k_left = max(0.0, (zs["budget"] or 0) - zs["delivered"]
+                         - zs["unplanned"])
+            with self._db_lock:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO decisions (cycle_id, zone,"
+                    " issued_ts, target, slab_t, k_left, slab_need, capped,"
+                    " low_none, low_with, rate, state, params) VALUES"
+                    " (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (live["cycle_id"], name, t_now, self.target_low,
+                     round(x[1], 2), round(k_left, 1), round(need, 1),
+                     int(capped), round(l0, 2), round(l1, 2), round(rate, 1),
+                     json.dumps([round(v, 4) for v in x]), json.dumps(p)))
+                self._db.commit()
+            parts.append("%s: slab %.0f%s vs k %.0f (Ts %.1f, low %.1f->%.1f)"
+                         % (name, need, " CAPPED" if capped else "", k_left,
+                            x[1], l0, l1))
+        self._event(None, "slab_decision", "%s target %.1f | %s" % (
+            live["cycle_id"], self.target_low, " | ".join(parts)))
+
+    def _score_decisions(self, cycle_id, cs, ce):
+        """Re-run each decision's model from its stored state with the heat
+        and weather that actually happened; compare with the actual low."""
+        ns = self._at(cs, self.night_start).timestamp()
+        ce = ce.timestamp()
+        with self._db_lock:
+            rows = self._db.execute(
+                "SELECT zone, issued_ts, state, params FROM decisions WHERE"
+                " cycle_id=?", (cycle_id,)).fetchall()
+        out = []
+        for zone, issued, state, params in rows:
+            steps = self._slab_steps(zone, issued, ce)
+            if not steps or any(r["Tout"] is None for r in steps):
+                continue
+            sim = tb_slab.simulate(json.loads(params), json.loads(state),
+                                   steps)
+            hind = [a for (a, _), r in zip(sim, steps) if ns <= r["t"] < ce]
+            act = tb_slab.robust_low(steps, ns, ce)
+            added = sum(r["q"] for r in steps) * 100.0
+            hl = min(hind) if hind else None
+            with self._db_lock:
+                self._db.execute(
+                    "UPDATE decisions SET added=?, hind_low=?, actual_low=?"
+                    " WHERE cycle_id=? AND zone=?",
+                    (round(added, 1), None if hl is None else round(hl, 2),
+                     act, cycle_id, zone))
+                self._db.commit()
+            if hl is not None and act is not None:
+                out.append("%s added %.0f model %.1f act %.1f" % (
+                    zone, added, hl, act))
+        return out
+
     def _predict(self, kind):
         """Shadow only: predict each zone's no-heat morning low and log it."""
         if not self.predict_enabled or not self.live:
@@ -1011,6 +1109,13 @@ class ThermalBattery(hass.Hass):
                     live["cycle_id"], " | ".join(scored)))
         except Exception as exc:  # noqa: BLE001
             self.log("prediction scoring failed: %s" % exc, level="WARNING")
+        try:
+            scored = self._score_decisions(live["cycle_id"], cs, ce)
+            if scored:
+                self._event(None, "decision_score", "%s | %s" % (
+                    live["cycle_id"], " | ".join(scored)))
+        except Exception as exc:  # noqa: BLE001
+            self.log("decision scoring failed: %s" % exc, level="WARNING")
         self._prune()
 
     def _night_low(self, zone, start, end):
@@ -1139,6 +1244,13 @@ class ThermalBattery(hass.Hass):
                                 lux, int(away), outdoor))
 
         self._maybe_start_sessions(away, backup, now)
+        if (self.slab_enabled and not self.live.get("slab_decided")
+                and self._in_window(now)):
+            self.live["slab_decided"] = True
+            try:
+                self._slab_decide(now)
+            except Exception as exc:  # noqa: BLE001
+                self.log("slab decision failed: %s" % exc, level="WARNING")
         self._stale_check(self.supply_entity, sup, sup_age, any_flow_long)
 
         if samples:

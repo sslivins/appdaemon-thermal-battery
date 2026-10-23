@@ -151,6 +151,27 @@ morning low, °C):
 With forecasts as issued, forecast error dominates and the two models are
 close.
 
+### Shadow charge decision
+
+The 09:00 budget (`k` × HDH) is set hours before charging starts, and
+anything in between (a backstop call, a sunny morning, a new forecast) only
+reaches it through the delivered/unplanned accounting. So when the charge
+window opens, the slab model makes its own decision (logged only):
+
+- it filters all data up to now, so heat from earlier in the day is simply
+  part of the slab state
+- it simulates charging from now at the zone's typical rate (75th
+  percentile of past heat per 30 min), with the latest forecast
+- it finds the smallest charge (C·min, same units as the budget) that keeps
+  the night's low (from `night_start`) at or above `target_low`, capped by
+  the window and `max_run_min`
+
+Each zone's result goes to the `decisions` table and a `slab_decision`
+event, next to the `k` budget still left. At grade, the model is re-run from
+the stored state with the heat and weather that actually happened
+(`added`, `hind_low`), and compared with the actual low. That checks the
+model's heat response without letting it drive the thermostats.
+
 ## Screaming
 
 These conditions raise an HA persistent notification, set
@@ -203,6 +224,7 @@ SQLite `thermal_battery.db` in the app directory has these tables:
 - `forecast_snap`: the next 30 h of forecast as issued at each refresh
 - `predictions`: shadow predictor output and scores (`model_low`,
   `slab_low`, `slab_t`)
+- `decisions`: shadow charge decision at window open and its grade
 - `loop_calls`: per heat call, the return dip, dip time, loop transit time
   and plateau
 - `cycles`: one graded row per zone per day

@@ -45,6 +45,7 @@ import appdaemon.plugins.hass.hassapi as hass
 import requests
 
 import tb_model
+import tb_slab
 
 try:
     import paho.mqtt.client as mqtt
@@ -155,10 +156,15 @@ class ThermalBattery(hass.Hass):
         self.predict_min_days = float(p.get("min_train_days", 3))
         self.predict_lambda = float(p.get("ridge_lambda", 0.05))
         # Weight of the model vs last night's low in the logged prediction
-        # (1 = model only). The model alone over-reacts to one-day weather
-        # swings; a 50/50 blend roughly halved the 09:00 error in backtest.
-        self.predict_blend = min(1.0, max(0.0, float(p.get("blend", 0.5))))
+        # (1 = model only). Last night's low ignores the weather, so it lags
+        # whenever a night is colder or warmer than the one before.
+        self.predict_blend = min(1.0, max(0.0, float(p.get("blend", 1.0))))
         self.morning_hours = float(p.get("morning_hours", 6))
+        # Second shadow predictor: two-node air + slab model with a Kalman
+        # filter (tb_slab). Refit daily in a background thread.
+        self.slab_enabled = bool(p.get("slab", True))
+        self._slab_params = {}
+        self._slab_busy = False
         # Push via another HA instance's REST API (e.g. the home HA that has
         # the phone's mobile_app): [{url, token, service}]
         self.remote_notify = [r for r in (a.get("remote_notify") or [])
@@ -186,6 +192,8 @@ class ThermalBattery(hass.Hass):
                 "max_run_min": float(z.get("max_run_min", 240)),
                 "max_budget": float(z.get("max_budget", 5000)),
                 "priority": int(z.get("priority", i)),
+                # thermostat reports whole degF (coarser air reading)
+                "air_coarse": bool(z.get("air_coarse", False)),
             })
         self.zones.sort(key=lambda z: z["priority"])
         self.zmap = {z["name"]: z for z in self.zones}
@@ -199,6 +207,7 @@ class ThermalBattery(hass.Hass):
 
         self.k = self._load_k()
         self.live = self._kv_get("live")
+        self._slab_params = self._kv_get("slab_params") or {}
         self.weather_ok_ts = (self._kv_get("weather_ok_ts") or 0)
         self._problems = {}
         self._pending = {}
@@ -233,6 +242,12 @@ class ThermalBattery(hass.Hass):
         self._startup_cycle()
         self._recover_stuck_setpoints()
         self._started = True
+        if self.slab_enabled:
+            stale = [z["name"] for z in self.zones if time.time() - (
+                self._slab_params.get(z["name"]) or {}).get("ts", 0)
+                > 20 * 3600]
+            if stale:
+                self._slab_refit_async()
 
         self.run_every(self._tick, "now+5", self.tick_s)
         self.run_every(self._refresh_weather, "now+%d" % int(
@@ -310,6 +325,17 @@ class ThermalBattery(hass.Hass):
                 c.execute("ALTER TABLE predictions ADD COLUMN model_low REAL")
             except sqlite3.OperationalError:
                 pass
+            for col in ("slab_low REAL", "slab_t REAL"):
+                try:  # tb_slab prediction and estimated slab temp at issue
+                    c.execute("ALTER TABLE predictions ADD COLUMN " + col)
+                except sqlite3.OperationalError:
+                    pass
+            # One row per heat call: return-water dip (slab temp) and loop
+            # transit time (call start -> hot front midpoint at the return).
+            c.execute("CREATE TABLE IF NOT EXISTS loop_calls (zone TEXT,"
+                      " t0 INTEGER, dip REAL, t_dip REAL, t_front REAL,"
+                      " plateau REAL, valid INTEGER,"
+                      " PRIMARY KEY(zone, t0))")
             c.commit()
 
     def _kv_get(self, key):
@@ -587,6 +613,8 @@ class ThermalBattery(hass.Hass):
         self.live = self._new_live(cs, partial=False)
         self._make_plan()
         self._predict("plan")
+        if self.slab_enabled:
+            self._slab_refit_async()
 
     def _on_predict_time(self, kwargs):
         self._predict("replan")
@@ -656,6 +684,101 @@ class ThermalBattery(hass.Hass):
         return tb_model.build_steps(samples, weather, start_ts, end_ts,
                                     self.sample_s / 60.0)
 
+    # ------------------------------------------------------- slab model --
+    def _slab_samples(self, name, start_ts, end_ts):
+        with self._db_lock:
+            return self._db.execute(
+                "SELECT ts, air, calling, supply, ret, away, outdoor, floor"
+                " FROM samples WHERE zone=? AND ts>=? AND ts<? ORDER BY ts",
+                (name, int(start_ts), int(end_ts))).fetchall()
+
+    def _slab_steps(self, name, start_ts, end_ts, samples=None):
+        if samples is None:
+            samples = self._slab_samples(name, start_ts, end_ts)
+        with self._db_lock:
+            weather = self._db.execute(
+                "SELECT hour_ts, temp, gti FROM weather_hourly WHERE"
+                " hour_ts>=? AND hour_ts<? ORDER BY hour_ts",
+                (int(start_ts) - 7200, int(end_ts) + 7200)).fetchall()
+        return tb_slab.build_steps(samples, weather, start_ts, end_ts,
+                                   self.sample_s / 60.0)
+
+    def _slab_refit_async(self):
+        if self._slab_busy:
+            return
+        self._slab_busy = True
+        threading.Thread(target=self._slab_refit, name="tb_slab_fit",
+                         daemon=True).start()
+
+    def _slab_refit(self):
+        """Background: log new heat calls (dip + loop transit) and refit
+        each zone's slab model, warm-started from yesterday's fit."""
+        try:
+            now = time.time()
+            start = now - self.predict_train_days * 86400
+            for z in self.zones:
+                name = z["name"]
+                samples = self._slab_samples(name, start, now)
+                self._log_loop_calls(name, samples, now)
+                steps = self._slab_steps(name, start, now, samples)
+                prev = (self._slab_params.get(name) or {}).get("p")
+                t0 = time.time()
+                p, cost, n = tb_slab.fit(steps, z["air_coarse"], start=prev)
+                self._slab_params[name] = {
+                    "p": {k: round(v, 6) for k, v in p.items()},
+                    "ts": int(now), "n": n}
+                self.log("slab fit %s: %s (n=%d, %.1fs)" % (
+                    name, " ".join("%s=%.3g" % (k, v) for k, v in p.items()),
+                    n, time.time() - t0))
+            self._kv_set("slab_params", self._slab_params)
+        except Exception as exc:  # noqa: BLE001
+            self.log("slab refit failed: %s" % exc, level="WARNING")
+        finally:
+            self._slab_busy = False
+
+    def _log_loop_calls(self, name, samples, now):
+        for c in tb_slab.call_signatures(samples):
+            # wait for the plateau before recording a call
+            if now - c["t0"] < tb_slab.FRONT_PLATEAU_MIN * 60 + 600:
+                continue
+            with self._db_lock:
+                cur = self._db.execute(
+                    "INSERT OR IGNORE INTO loop_calls (zone, t0, dip, t_dip,"
+                    " t_front, plateau, valid) VALUES (?,?,?,?,?,?,?)",
+                    (name, int(c["t0"]), c["dip"], c["t_dip"], c["t_front"],
+                     c["plateau"], int(c["valid"])))
+                self._db.commit()
+            if cur.rowcount:
+                self._event(name, "loop_call", "call %s: dip %.2f C at"
+                            " %.1f min, hot front %s, plateau %s%s" % (
+                                self._hhmm_ts(c["t0"]), c["dip"], c["t_dip"],
+                                "%.1f min" % c["t_front"] if c["t_front"]
+                                else "-",
+                                "%.1f C" % c["plateau"] if c["plateau"]
+                                else "-",
+                                "" if c["valid"] else " (not a slab reading)"))
+
+    def _hhmm_ts(self, ts):
+        return dt.datetime.fromtimestamp(ts, self.tz).strftime("%m-%d %H:%M")
+
+    def _slab_predict(self, z, now, t_now, ce, m0):
+        """-> (morning low, slab temp now) or None."""
+        name = z["name"]
+        p = (self._slab_params.get(name) or {}).get("p") \
+            or tb_slab.default_params()
+        hist = self._slab_steps(
+            name, now - self.predict_train_days * 86400, t_now)
+        x, _, _, _ = tb_slab.kfilter(p, hist, z["air_coarse"])
+        if x is None:
+            return None
+        future = tb_slab.build_steps(
+            [], self._weather_rows(t_now, ce), t_now, ce)
+        if any(r["Tout"] is None for r in future):
+            return None
+        sim = tb_slab.simulate(p, x, future)
+        lows = [a for (a, _), r in zip(sim, future) if m0 <= r["t"] < ce]
+        return (min(lows), x[1]) if lows else None
+
     def _predict(self, kind):
         """Shadow only: predict each zone's no-heat morning low and log it."""
         if not self.predict_enabled or not self.live:
@@ -705,19 +828,31 @@ class ThermalBattery(hass.Hass):
             w = self.predict_blend if persist is not None else 1.0
             pred = round(w * model + (1 - w) * (persist or 0.0), 2)
             live["zones"][name]["pred_low"] = pred
+            slab = None
+            if self.slab_enabled:
+                try:
+                    slab = self._slab_predict(z, now, t_now, ce, m0)
+                except Exception as exc:  # noqa: BLE001
+                    self.log("slab predict %s failed: %s" % (name, exc),
+                             level="WARNING")
             with self._db_lock:
                 self._db.execute(
                     "INSERT OR REPLACE INTO predictions (cycle_id, zone,"
                     " issued_ts, kind, t0, pred_low, persist_low, n_train,"
-                    " plausible, coef, model_low) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    " plausible, coef, model_low, slab_low, slab_t)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (live["cycle_id"], name, int(now), kind, T0, pred,
                      persist, n, int(ok),
                      json.dumps(dict(zip(tb_model.NAMES,
                                          [round(c, 5) for c in coef]))),
-                     round(model, 2)))
+                     round(model, 2),
+                     round(slab[0], 2) if slab else None,
+                     round(slab[1], 2) if slab else None))
                 self._db.commit()
-            parts.append("%s: %.1f (model %.1f, now %.1f, last %s)%s" % (
-                name, pred, model, T0, persist, "" if ok else " IMPLAUSIBLE"))
+            parts.append("%s: %.1f (model %.1f, slab %s, now %.1f, last %s)%s"
+                         % (name, pred, model,
+                            "%.1f/Ts %.1f" % slab if slab else "-", T0,
+                            persist, "" if ok else " IMPLAUSIBLE"))
         self._save_live()
         self._event(None, "predict", "%s %s no-heat morning low | %s" % (
             live["cycle_id"], kind, " | ".join(parts)))

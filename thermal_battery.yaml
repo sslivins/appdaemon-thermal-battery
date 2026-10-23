@@ -81,7 +81,8 @@ thermal_battery:
     train_days: 21
     min_train_days: 3
     ridge_lambda: 0.05
-    blend: 0.5          # model weight vs last night's low (1 = model only)
+    blend: 1.0          # model weight vs last night's low (1 = model only)
+    slab: true          # also log the air+slab Kalman model (tb_slab)
     morning_hours: 6
   # Phone push via the home HA (BDL has no mobile_app). Test by firing the
   # HA event `thermal_battery_test_notify` on BDL.
@@ -112,6 +113,7 @@ thermal_battery:
       max_run_min: 240
     - name: basement_bunk_rooms
       climate: climate.basement_bunk_rooms
+      air_coarse: true   # thermostat reports whole degF
       covers:
         - cover.double_bunk_room_bedroom_shades
         - cover.queen_and_bunk_bedroom_window_shade
@@ -137,6 +139,7 @@ thermal_battery:
       max_run_min: 120
     - name: basement_master
       climate: climate.basement_master
+      air_coarse: true   # thermostat reports whole degF
       covers:
         - cover.basement_master_bedroom_large_window_shade
         - cover.basement_master_bedroom_small_shades
@@ -145,6 +148,7 @@ thermal_battery:
       max_run_min: 120
     - name: ski_room
       climate: climate.ski_room
+      air_coarse: true   # thermostat reports whole degF
       return_entity: sensor.thermux_ski_room_return
       floor_entities:
         - sensor.ski_room_bdl_temperature

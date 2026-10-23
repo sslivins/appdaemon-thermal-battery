@@ -91,14 +91,65 @@ the zone got no heat after it was issued. The predictor needs
 physical values. Implausible fits (for example a negative loss) are logged
 and flagged.
 
-The logged prediction (`pred_low`) is a blend: `blend` (default 0.5) × the
-model plus the rest × last night's low. On its own the model over-reacts to a
-single milder or colder day, because the slab smooths those out. In a backtest
-over Oct 16–21 (forecasts as issued) the blend cut the 09:00 error from
-0.43 °C (model only) and 0.45 °C (last night's low only) to 0.25 °C. A
-longer mass memory (48–120 h), forecast bias correction and snapping to
-whole °F didn't help. The raw model output is kept in `model_low`, and the
-report shows all three.
+The logged prediction (`pred_low`) can blend in last night's low:
+`blend` × the model plus the rest × last night's low. The default is now
+1.0 (model only). Last night's low ignores the weather, so it lags whenever a
+night is colder or warmer than the one before, and it only scored well in the
+whole-°F zones because their readings barely move. The raw model output is
+kept in `model_low`.
+
+## Slab model (`tb_slab.py`)
+
+A second shadow predictor (`predict.slab: true`). The slab's stored heat is
+the biggest unknown when predicting a zone, so this model tracks it
+explicitly. It has two nodes, air `Ta` and slab `Ts`, plus a short "tube"
+store that delays heat input by about 1 h (floor sensors peak about an hour
+after a call ends). A Kalman filter estimates the slab temperature from:
+
+- air temperature, every 30 min
+- floor surface sensors (`floor_entities`), where the zone has them
+- the **return-water dip**: in the first minutes of a call, the water that
+  sat in the loop comes back at slab temperature before the hot front gets
+  round. It is used only if the loop was idle for at least 60 min. It
+  matched the floor sensors to within about 0.1–0.35 °C.
+
+Heat input is the integral of (supply − return) while calling (pumps are
+fixed speed, so this is proportional to energy). Parameters are fitted per
+zone by maximum likelihood with log-normal priors. The fit runs once a day in
+a background thread after the 09:00 plan (and at startup if older than 20 h);
+it is warm-started and cached in `kv.slab_params`. Each predict time filters
+the history and free-runs the forecast with no heat. The predictions table
+gets `slab_low` (the predicted low) and `slab_t` (the estimated slab
+temperature at issue).
+
+Each heat call is logged in `loop_calls` (and as a `loop_call` event) with:
+
+- the dip temperature
+- the time the dip occurred
+- the **loop transit time**: call start to the steepest rise of the return,
+  when the hot front reaches the return probe
+
+Early transits: main floor 4–5 min, master bedroom 6–6.5 min, basement
+master 9.5 min (samples are 1–1.5 min apart).
+
+Set `air_coarse: true` for zones whose thermostat reports whole °F. A zone
+with no floor sensor and no heat calls has nothing that observes its slab
+(basement bunk so far), so its slab estimate is weakly held near air
+temperature, and its old-model prediction is likely the better one.
+
+Backtest, Oct 13–23, hindcast from 18:00 with actual weather (MAE of the
+morning low, °C):
+
+| Zone | Old | Slab |
+|---|---|---|
+| Main floor | 0.53 | 0.20 |
+| Master bedroom | 0.92 | 0.37 |
+| Basement master | 0.49 | 0.26 |
+| Ski room | 0.29 | 0.29 |
+| Basement bunk | 0.16 | 0.23 |
+
+With forecasts as issued, forecast error dominates and the two models are
+close.
 
 ## Screaming
 
@@ -150,7 +201,10 @@ SQLite `thermal_battery.db` in the app directory has these tables:
 - `weather_hourly`: latest temperature, cloud, sun and wind per hour
   (overwritten as forecasts are replaced by analysis)
 - `forecast_snap`: the next 30 h of forecast as issued at each refresh
-- `predictions`: shadow predictor output and scores
+- `predictions`: shadow predictor output and scores (`model_low`,
+  `slab_low`, `slab_t`)
+- `loop_calls`: per heat call, the return dip, dip time, loop transit time
+  and plateau
 - `cycles`: one graded row per zone per day
 - `events`
 - `k_values`
@@ -173,4 +227,4 @@ Requires `requests` and `paho-mqtt` (both present in the AppDaemon image) and
 python3 ~/docker/appdaemon/conf/apps/thermal_battery/tools/report.py --days 3
 ```
 
-Shows the current plan and charge per zone, graded cycles (morning low, k change and reason), learned `k`, shadow predictions with MAE vs persistence, the last 24 h of events, and problems found in the log.
+Shows the current plan and charge per zone, graded cycles (morning low, k change and reason), learned `k`, shadow predictions (old model, slab model and last night's low) with MAE, heat calls with the return dip and median loop transit per zone, the last 24 h of events, and problems found in the log.

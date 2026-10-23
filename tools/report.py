@@ -22,36 +22,71 @@ def _predictions(db, since):
         rows = db.execute(
             "SELECT cycle_id, zone, issued_ts, kind, t0, pred_low,"
             " persist_low, actual_low, valid, plausible,"
-            " COALESCE(model_low, pred_low) FROM predictions"
+            " COALESCE(model_low, pred_low), slab_low, slab_t FROM predictions"
             " WHERE cycle_id>=? ORDER BY cycle_id, zone, issued_ts",
             (since,)).fetchall()
     except sqlite3.OperationalError:
         return
     print("\n== Shadow no-heat morning-low predictions since %s" % since)
-    print("   (pred = blend of model and last night's low)")
-    print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s %5s  %s" % (
-        "cycle", "zone", "at", "kind", "now", "pred", "model", "last", "act",
-        "note"))
+    print("   (model = tb_model, slab = air+slab Kalman model, Ts = its slab"
+          " estimate, last = last night's low)")
+    print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s %5s %5s  %s" % (
+        "cycle", "zone", "at", "kind", "now", "model", "slab", "Ts", "last",
+        "act", "note"))
     err = {}
-    for cid, zone, ts, kind, t0, pred, persist, act, valid, ok, model in rows:
+    for (cid, zone, ts, kind, t0, pred, persist, act, valid, ok, model,
+         slab, slab_t) in rows:
         note = []
         if not ok:
             note.append("implausible")
         if act is not None and not valid:
             note.append("heated")
-        print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s %5s  %s" % (
-            cid, zone, _fmt(ts), kind, _r(t0), _r(pred), _r(model),
-            _r(persist), _r(act), " ".join(note)))
-        if valid and act is not None and persist is not None:
+        print("   %-10s %-20s %-5s %-6s %5s %5s %5s %5s %5s %5s  %s" % (
+            cid, zone, _fmt(ts), kind, _r(t0), _r(model), _r(slab),
+            _r(slab_t), _r(persist), _r(act), " ".join(note)))
+        if valid and act is not None:
             e = err.setdefault((zone, kind), [])
-            e.append((abs(pred - act), abs(model - act), abs(persist - act)))
+            e.append(tuple(None if v is None else abs(v - act)
+                           for v in (model, slab, persist)))
     if err:
-        print("   MAE on valid (no-heat) nights: pred vs model vs persistence")
+        print("   MAE on valid (no-heat) nights")
         for (zone, kind), e in sorted(err.items()):
-            print("   %-20s %-6s n=%-3d pred %.2f  model %.2f  persist %.2f"
-                  % (zone, kind, len(e), sum(x[0] for x in e) / len(e),
-                     sum(x[1] for x in e) / len(e),
-                     sum(x[2] for x in e) / len(e)))
+            print("   %-20s %-6s n=%-3d model %s  slab %s  last %s" % (
+                zone, kind, len(e), _mae(e, 0), _mae(e, 1), _mae(e, 2)))
+
+
+def _mae(e, i):
+    v = [x[i] for x in e if x[i] is not None]
+    return "%.2f" % (sum(v) / len(v)) if v else "  - "
+
+
+def _loop_calls(db, since):
+    try:
+        rows = db.execute(
+            "SELECT zone, t0, dip, t_dip, t_front, plateau, valid FROM"
+            " loop_calls ORDER BY zone, t0").fetchall()
+    except sqlite3.OperationalError:
+        return
+    if not rows:
+        return
+    print("\n== Heat calls: return dip (slab temp) and loop transit")
+    print("   %-20s %-11s %5s %6s %7s %6s  %s" % (
+        "zone", "start", "dip", "t_dip", "front", "plat", "note"))
+    by = {}
+    for zone, t0, dip, td, tf, plat, ok in rows:
+        if tf is not None:
+            by.setdefault(zone, []).append(tf)
+        if _fmt(t0, "%Y-%m-%d") >= since:
+            print("   %-20s %-11s %5s %6s %7s %6s  %s" % (
+                zone, _fmt(t0, "%m-%d %H:%M"), _r(dip),
+                "%.1fm" % td if td is not None else "-",
+                "%.1fm" % tf if tf is not None else "-", _r(plat),
+                "" if ok else "not a slab reading"))
+    print("   median loop transit (all calls):")
+    for zone, v in sorted(by.items()):
+        v.sort()
+        print("   %-20s %4.1f min  (n=%d, %.1f-%.1f)" % (
+            zone, v[len(v) // 2], len(v), v[0], v[-1]))
 
 
 def _forecast_check(db, days):
@@ -149,6 +184,7 @@ def main():
         print("   %-20s %.3f  (%s)" % (z, k, upd[:16]))
 
     _predictions(db, since)
+    _loop_calls(db, since)
     _forecast_check(db, a.days)
 
     cutoff = int((dt.datetime.now() - dt.timedelta(days=1)).timestamp())

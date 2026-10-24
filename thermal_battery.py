@@ -107,6 +107,11 @@ class ThermalBattery(hass.Hass):
         self.hdh_base = float(a.get("hdh_base_c", 15.0))
 
         self.grade_time = _hhmm(a.get("grade_time", "09:00"))
+        # Backstop calls running at grade_time (or starting within the
+        # grace after it) belong to the night that is ending: grading waits
+        # for them to finish so their heat is booked to that cycle.
+        self.carry_grace_min = float(a.get("carry_grace_min", 30))
+        self.carry_max_min = float(a.get("carry_max_min", 240))
         self.night_start = _hhmm(a.get("night_start", "22:00"))
         self.window_earliest = _hhmm(a.get("window_earliest", "11:00"))
         self.window_latest = _hhmm(a.get("window_latest", "19:00"))
@@ -207,6 +212,7 @@ class ThermalBattery(hass.Hass):
 
         self.k = self._load_k()
         self.live = self._kv_get("live")
+        self.pending_grade = self._kv_get("pending_grade")
         self._slab_params = self._kv_get("slab_params") or {}
         self.weather_ok_ts = (self._kv_get("weather_ok_ts") or 0)
         self._problems = {}
@@ -609,6 +615,8 @@ class ThermalBattery(hass.Hass):
                 self._make_plan(retry=True)
             self._event(None, "resume_cycle", cid)
             return
+        if self.pending_grade:
+            self._finish_grade("late")
         if self.live:
             self._event(None, "late_grade", self.live.get("cycle_id"))
             self._grade()
@@ -620,12 +628,101 @@ class ThermalBattery(hass.Hass):
         if self.live and self.live.get("cycle_id") == cs.strftime("%Y-%m-%d"):
             return  # already rolled (tick and run_daily can race)
         self._refresh_weather({})
-        self._grade()
+        if self.pending_grade:
+            self._finish_grade("next roll")
+        old = self.live
+        if old:
+            for name, zs in old["zones"].items():
+                if zs.get("session"):
+                    self._end_session(name, "grade", restore=True)
         self.live = self._new_live(cs, partial=False)
+        held = []
+        if old:
+            for name, zs in old["zones"].items():
+                nz = self.live["zones"].get(name)
+                if nz is not None:
+                    nz["call_start"] = zs.get("call_start")
+                if zs.get("call_start") is not None:
+                    zs["carry"] = True
+                    zs["carry_start"] = zs["call_start"]
+                    held.append(name)
         self._make_plan()
         self._predict("plan")
+        if old and (held or self.carry_grace_min > 0):
+            self.pending_grade = old
+            self._kv_set("pending_grade", old)
+            self._event(None, "grade_held", "%s carrying %s" % (
+                old.get("cycle_id"), held or "none (grace)"))
+        else:
+            if old:
+                self._grade(old)
+            self._after_grade()
+
+    def _finish_grade(self, why):
+        p = self.pending_grade
+        if not p:
+            return
+        self.pending_grade = None
+        self._kv_set("pending_grade", None)
+        carried = {n: round(z.get("unplanned", 0.0), 1)
+                   for n, z in p["zones"].items() if z.get("carry_start")}
+        self._event(None, "grade_release", "%s (%s) carried zones %s" % (
+            p.get("cycle_id"), why, carried))
+        self._grade(p)
+        self._rebudget()
+        self._after_grade()
+
+    def _after_grade(self):
         if self.slab_enabled:
             self._slab_refit_async()
+
+    def _rebudget(self):
+        """k may have changed at a deferred grade: re-size today's budgets
+        for zones that have not started charging."""
+        live = self.live
+        hdh = live.get("plan_hdh") if live else None
+        if hdh is None:
+            return
+        changed = {}
+        for z in self.zones:
+            zs = live["zones"][z["name"]]
+            if zs.get("session") or zs.get("done") or zs["delivered"] > 0:
+                continue
+            k = self.k[z["name"]]
+            b = round(min(k * hdh, z["max_budget"]), 1)
+            if b != zs.get("budget"):
+                changed[z["name"]] = (zs.get("budget"), b)
+            zs["k_used"] = round(k, 4)
+            zs["budget"] = b
+        self._save_live()
+        if changed:
+            self._event(None, "rebudget", "%s %s" % (live["cycle_id"],
+                                                    changed))
+
+    def _carry_zone(self, name, calling, new_call, session, now):
+        """Pending-cycle zone dict that a backstop call's heat should be
+        booked to, or None."""
+        p = self.pending_grade
+        if not p:
+            return None
+        pz = p["zones"].get(name)
+        if pz is None:
+            return None
+        if pz.get("carry"):
+            if calling and not session:
+                return pz
+            pz["carry"] = False
+            pz["carry_end"] = now
+            return None
+        if (new_call and not session and now < p["cycle_start"] + 86400
+                + self.carry_grace_min * 60):
+            pz["carry"] = True
+            pz.setdefault("carry_start", now)
+            self._event(name, "carry_call", "backstop call within %.0f min"
+                        " of grade time booked to %s" % (
+                            self.carry_grace_min, p.get("cycle_id")))
+            return pz
+        return None
 
     def _on_predict_time(self, kwargs):
         self._predict("replan")
@@ -994,15 +1091,16 @@ class ThermalBattery(hass.Hass):
         return list(out.values())
 
     # ============================================================== grade ==
-    def _grade(self):
-        live = self.live
+    def _grade(self, live=None):
+        own = live is None
+        live = self.live if own else live
         if not live:
             return
         cs = dt.datetime.fromtimestamp(live["cycle_start"], self.tz)
         ce = cs + dt.timedelta(days=1)
         # End any session still open (shouldn't happen - window is earlier).
         for name, zs in live["zones"].items():
-            if zs.get("session"):
+            if own and zs.get("session"):
                 self._end_session(name, "grade", restore=True)
         om_hdh, _ = self._hdh(cs, ce)
         meas_hdh = self._measured_hdh(cs, ce)
@@ -1016,7 +1114,13 @@ class ThermalBattery(hass.Hass):
             zs = live["zones"].get(name)
             if not zs:
                 continue
-            low, floor_low, coverage = self._night_low(name, night_start, ce)
+            low_end = ce
+            if zs.get("carry_start"):
+                # The dip that triggered a carried call is part of the night.
+                low_end = max(ce, dt.datetime.fromtimestamp(
+                    zs.get("carry_end") or time.time(), self.tz))
+            low, floor_low, coverage = self._night_low(name, night_start,
+                                                       low_end)
             delivered, unplanned = zs["delivered"], zs["unplanned"]
             unplanned_min = zs.get("unplanned_min", 0.0)
             needed = delivered + unplanned
@@ -1069,7 +1173,8 @@ class ThermalBattery(hass.Hass):
                 "unplanned_min": round(unplanned_min, 1),
                 "dry_run": self.dry_run, "coverage": round(coverage, 2),
                 "hdh_src": hdh_src, "hdh_om": None if om_hdh is None
-                else round(om_hdh, 1)}
+                else round(om_hdh, 1),
+                "carried": bool(zs.get("carry_start"))}
             with self._db_lock:
                 self._db.execute(
                     "INSERT OR REPLACE INTO cycles (cycle_id, zone, plan_hdh,"
@@ -1198,10 +1303,13 @@ class ThermalBattery(hass.Hass):
             else:
                 self._set_problem("climate:" + name, False)
             calling = c["action"] == "heating"
-            if calling and zs["call_start"] is None:
+            new_call = calling and zs["call_start"] is None
+            if new_call:
                 zs["call_start"] = now
             elif not calling:
                 zs["call_start"] = None
+            pz = self._carry_zone(name, calling, new_call,
+                                  bool(zs["session"]), now)
             if c["available"]:
                 self._heat_watch(name, calling, c["air"],
                                  bool(zs["session"]), now)
@@ -1216,10 +1324,13 @@ class ThermalBattery(hass.Hass):
                 q = max(0.0, sup - ret) * dt_min
                 if zs["session"]:
                     zs["delivered"] += q
+                elif pz is not None:
+                    pz["unplanned"] += q
                 else:
                     zs["unplanned"] += q
             if calling and dt_min > 0 and not zs["session"]:
-                zs["unplanned_min"] = zs.get("unplanned_min", 0.0) + dt_min
+                acc = pz if pz is not None else zs
+                acc["unplanned_min"] = acc.get("unplanned_min", 0.0) + dt_min
             if zs["session"]:
                 zs["run_min"] += dt_min
 
@@ -1242,6 +1353,17 @@ class ThermalBattery(hass.Hass):
                                 c["setpoint"], int(calling), sup, ret,
                                 int(bool(zs["session"])), self._blinds(z),
                                 lux, int(away), outdoor))
+
+        p = self.pending_grade
+        if p:
+            pce = p["cycle_start"] + 86400
+            carrying = [n for n, s in p["zones"].items() if s.get("carry")]
+            if not carrying and now >= pce + self.carry_grace_min * 60:
+                self._finish_grade("calls done")
+            elif now >= pce + self.carry_max_min * 60:
+                self._finish_grade("cap; still calling %s" % carrying)
+            else:
+                self._kv_set("pending_grade", p)
 
         self._maybe_start_sessions(away, backup, now)
         if (self.slab_enabled and not self.live.get("slab_decided")

@@ -57,6 +57,14 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
   - If a zone couldn't deliver its budget (it hit max run or the window end),
     `k` is not raised. This prevents wind-up, and the grade reports
     "capacity-limited".
+  - **Morning carry.** A backstop call that is running at `grade_time`, or
+    starts within `carry_grace_min` (30) after it, is covering the night that
+    just ended. The new cycle starts on time (plan and prediction at
+    `grade_time`), but the old cycle's grade is held (`grade_held`) and that
+    call's heat is booked to the old cycle until it ends. Its night low also
+    extends to the end of the call. The grade then runs (`grade_release`) and
+    today's budgets are re-sized with the new `k` (`rebudget`) for zones that
+    haven't charged yet. The grade is forced after `carry_max_min` (240).
 - **Electric backup.** While the backup runs, charging pauses and setpoints are
   restored. Charging resumes after `backup_cooldown_min`.
 

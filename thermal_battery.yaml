@@ -8,6 +8,8 @@ thermal_battery:
   # Start in shadow mode: never touches a setpoint, but plans, logs what it
   # would do, and learns k from the backstop (12C thermostat) heat.
   dry_run: true
+  # Zones that charge for real anyway (staged rollout out of shadow mode).
+  live_zones: [master_bedroom]
 
   # Only operate while the house is in AWAY mode.
   away_entity: input_boolean.home_away_mode_enabled

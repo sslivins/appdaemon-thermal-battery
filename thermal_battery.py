@@ -91,6 +91,8 @@ class ThermalBattery(hass.Hass):
         a = self.args
         self.tz = ZoneInfo(str(a.get("timezone", "America/Vancouver")))
         self.dry_run = bool(a.get("dry_run", True))
+        # Zones that charge for real even while dry_run is on (staged rollout).
+        self.live_zones = set(a.get("live_zones") or [])
 
         self.away_entity = a["away_entity"]
         self.away_state = str(a.get("away_state", "on"))
@@ -240,8 +242,8 @@ class ThermalBattery(hass.Hass):
         if self.mqtt_enabled:
             self._mqtt_init()
 
-        self.log("ThermalBattery start: dry_run=%s zones=%s k=%s" % (
-            self.dry_run, [z["name"] for z in self.zones],
+        self.log("ThermalBattery start: dry_run=%s live=%s zones=%s k=%s" % (
+            self.dry_run, sorted(self.live_zones), [z["name"] for z in self.zones],
             {n: round(v, 3) for n, v in self.k.items()}))
 
         self._refresh_weather({})
@@ -477,8 +479,14 @@ class ThermalBattery(hass.Hass):
                 vals.append(1.0 if st["state"] == "open" else 0.0)
         return round(sum(vals) / len(vals), 2) if vals else None
 
+    def _is_live(self, name):
+        return not self.dry_run or name in self.live_zones
+
+    def _any_live(self):
+        return not self.dry_run or bool(self.live_zones)
+
     def _apply(self, z, temp, why):
-        if self.dry_run:
+        if not self._is_live(z["name"]):
             self.log("[dry_run] would set %s -> %.1fC (%s)" % (
                 z["climate"], temp, why))
             return
@@ -1171,7 +1179,7 @@ class ThermalBattery(hass.Hass):
             detail = {"overshoot": overshoot, "stop_reason": zs.get(
                 "stop_reason"), "run_min": round(zs.get("run_min", 0), 1),
                 "unplanned_min": round(unplanned_min, 1),
-                "dry_run": self.dry_run, "coverage": round(coverage, 2),
+                "dry_run": not self._is_live(name), "coverage": round(coverage, 2),
                 "hdh_src": hdh_src, "hdh_om": None if om_hdh is None
                 else round(om_hdh, 1),
                 "carried": bool(zs.get("carry_start"))}
@@ -1450,15 +1458,17 @@ class ThermalBattery(hass.Hass):
 
     def _maybe_start_sessions(self, away, backup, now):
         live = self.live
-        if (self.dry_run or not away or backup or live.get("plan_hdh") is None
+        if self.dry_run and self._in_window(now) and not live.get(
+                "dry_logged"):
+            live["dry_logged"] = True
+            self.log("[dry_run] window open: would charge %s" % {
+                n: "%.0f (have %.0f)" % (s["budget"] or 0,
+                                         s["delivered"] + s["unplanned"])
+                for n, s in live["zones"].items()
+                if not self._is_live(n)})
+        if (not self._any_live() or not away or backup
+                or live.get("plan_hdh") is None
                 or not self._in_window(now, self.min_session_min)):
-            if self.dry_run and self._in_window(now) and not live.get(
-                    "dry_logged"):
-                live["dry_logged"] = True
-                self.log("[dry_run] window open: would charge %s" % {
-                    n: "%.0f (have %.0f)" % (s["budget"] or 0,
-                                             s["delivered"] + s["unplanned"])
-                    for n, s in live["zones"].items()})
             return
         if (self._backup_clear_since is None or
                 now - self._backup_clear_since < self.backup_cooldown_min * 60):
@@ -1467,6 +1477,8 @@ class ThermalBattery(hass.Hass):
         for z in self.zones:
             if active >= self.max_concurrent:
                 break
+            if not self._is_live(z["name"]):
+                continue
             zs = live["zones"][z["name"]]
             if zs["session"] or zs["done"] or zs["restore"]:
                 continue
@@ -1527,7 +1539,7 @@ class ThermalBattery(hass.Hass):
 
     def _verify_restore(self, z, zs, c, now):
         r = zs["restore"]
-        if self.dry_run or c["setpoint"] is None:
+        if not self._is_live(z["name"]) or c["setpoint"] is None:
             zs["restore"] = None
             return
         if abs(c["setpoint"] - self.away_setpoint) <= SP_TOL:
@@ -1551,9 +1563,11 @@ class ThermalBattery(hass.Hass):
 
     def _recover_stuck_setpoints(self):
         """After a crash, put zones we were charging back to baseline."""
-        if self.dry_run or not self._is_away():
+        if not self._any_live() or not self._is_away():
             return
         for z in self.zones:
+            if not self._is_live(z["name"]):
+                continue
             zs = self.live["zones"][z["name"]]
             if zs.get("session"):
                 zs["session"] = None
@@ -1729,7 +1743,7 @@ class ThermalBattery(hass.Hass):
         live = self.live
         b = self.mqtt_base
         charging = [n for n, s in live["zones"].items() if s["session"]]
-        if self.dry_run:
+        if not self._any_live():
             state = "dry_run"
         elif not self._is_away():
             state = "home"
@@ -1749,6 +1763,7 @@ class ThermalBattery(hass.Hass):
             "window_end": fmt(live.get("window_end")),
             "window_mean_c": live.get("window_mean_c"),
             "charging": charging, "dry_run": self.dry_run,
+            "live_zones": sorted(self.live_zones),
             "weather_last_ok": fmt(self.weather_ok_ts),
         })
         lg = self._kv_get("last_grade") or {}

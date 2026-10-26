@@ -72,6 +72,9 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
 charge, and it still learns `k` from the backstop-only heat, which is a good
 way to bootstrap the model.
 
+`live_zones` lists zones that charge for real even while `dry_run` is on,
+for a staged rollout (one zone at a time). Everything else stays in shadow.
+
 ## Shadow predictor (`tb_model.py`)
 
 Logging only; it never changes a budget. At plan time and at

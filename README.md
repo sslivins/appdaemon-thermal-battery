@@ -84,7 +84,8 @@ return dip reads the slab temperature in zones without floor probes, and
 the slab model gets a fresh reading before the window-open decision. The
 probe must outlast the loop transit (basement master ~9.5 min). Zones that
 called within `recent_call_min` are skipped (that call already read the
-slab). Probe heat counts as delivered; probes don't count toward
+slab). Probe heat is kept separate (`probe_q`): it is neither delivered nor
+unplanned, so it doesn't feed `k` learning, and probes don't count toward
 `max_run_min`. Events: `probe_start` / `probe_end` / `probe_skip`.
 
 ## Shadow predictor (`tb_model.py`)
@@ -193,7 +194,12 @@ Each zone's result goes to the `decisions` table and a `slab_decision`
 event, next to the `k` budget still left. At grade, the model is re-run from
 the stored state with the heat and weather that actually happened
 (`added`, `hind_low`), and compared with the actual low. That checks the
-model's heat response without letting it drive the thermostats.
+model's heat response.
+
+For `live_zones` the decision does drive the charge: a live zone charges
+the larger of its remaining `k` budget and the slab model's need (`target`
+in the zone state; `session_start` logs both). Non-live zones are logged
+only.
 
 ## Screaming
 

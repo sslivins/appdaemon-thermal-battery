@@ -952,9 +952,14 @@ class ThermalBattery(hass.Hass):
                      int(capped), round(l0, 2), round(l1, 2), round(rate, 1),
                      json.dumps([round(v, 4) for v in x]), json.dumps(p)))
                 self._db.commit()
-            parts.append("%s: slab %.0f%s vs k %.0f (Ts %.1f, low %.1f->%.1f)"
+            zs["slab_need"] = round(need, 1)
+            charge = ""
+            if self._is_live(name) and need > k_left:
+                zs["target"] = zs["delivered"] + zs["unplanned"] + need
+                charge = " -> charge %.0f" % need
+            parts.append("%s: slab %.0f%s vs k %.0f (Ts %.1f, low %.1f->%.1f)%s"
                          % (name, need, " CAPPED" if capped else "", k_left,
-                            x[1], l0, l1))
+                            x[1], l0, l1, charge))
         self._event(None, "slab_decision", "%s target %.1f | %s" % (
             live["cycle_id"], self.target_low, " | ".join(parts)))
 
@@ -1342,7 +1347,9 @@ class ThermalBattery(hass.Hass):
             if (calling and dt_min > 0 and sup is not None and ret is not None
                     and now - zs["call_start"] >= self.flush_min * 60):
                 q = max(0.0, sup - ret) * dt_min
-                if zs["session"]:
+                if zs["session"] and zs["session"].get("probe"):
+                    zs["probe_q"] = zs.get("probe_q", 0.0) + q
+                elif zs["session"]:
                     zs["delivered"] += q
                 elif pz is not None:
                     pz["unplanned"] += q
@@ -1386,7 +1393,7 @@ class ThermalBattery(hass.Hass):
                 self._kv_set("pending_grade", p)
 
         self._maybe_start_probes(away, backup, now)
-        self._maybe_start_sessions(away, backup, now)
+        # Decide before sessions start: live zones size their charge from it.
         if (self.slab_enabled and not self.live.get("slab_decided")
                 and self._in_window(now)):
             self.live["slab_decided"] = True
@@ -1394,6 +1401,7 @@ class ThermalBattery(hass.Hass):
                 self._slab_decide(now)
             except Exception as exc:  # noqa: BLE001
                 self.log("slab decision failed: %s" % exc, level="WARNING")
+        self._maybe_start_sessions(away, backup, now)
         self._stale_check(self.supply_entity, sup, sup_age, any_flow_long)
 
         if samples:
@@ -1506,6 +1514,12 @@ class ThermalBattery(hass.Hass):
                         % (z["probe_min"] or self.probe_min))
             active += 1
 
+    @staticmethod
+    def _target(zs):
+        """Charge goal: the k budget, raised to the slab model's need for
+        live zones (set at window open by _slab_decide)."""
+        return max(zs["budget"] or 0, zs.get("target") or 0)
+
     def _maybe_start_sessions(self, away, backup, now):
         live = self.live
         if self.dry_run and self._in_window(now) and not live.get(
@@ -1532,7 +1546,7 @@ class ThermalBattery(hass.Hass):
             zs = live["zones"][z["name"]]
             if zs["session"] or zs["done"] or zs["restore"]:
                 continue
-            remaining = (zs["budget"] or 0) - zs["delivered"] - zs["unplanned"]
+            remaining = self._target(zs) - zs["delivered"] - zs["unplanned"]
             if remaining <= 0:
                 zs["done"] = True
                 zs["stop_reason"] = zs["stop_reason"] or "no need"
@@ -1546,8 +1560,9 @@ class ThermalBattery(hass.Hass):
             zs["session"] = {"start": now, "set_at": now}
             self._apply(z, self.charge_setpoint, "charge start, need %.0f"
                         % remaining)
-            self._event(z["name"], "session_start", "budget=%.0f remaining=%.0f"
-                        % (zs["budget"] or 0, remaining))
+            self._event(z["name"], "session_start",
+                        "budget=%.0f target=%.0f remaining=%.0f"
+                        % (zs["budget"] or 0, self._target(zs), remaining))
             active += 1
 
     def _supervise(self, z, zs, c, away, backup, now):
@@ -1570,7 +1585,7 @@ class ThermalBattery(hass.Hass):
             if now - zs["session"]["start"] >= pm * 60:
                 self._end_session(name, "done", restore=True)
             return
-        if zs["delivered"] + zs["unplanned"] >= (zs["budget"] or 0):
+        if zs["delivered"] + zs["unplanned"] >= self._target(zs):
             self._end_session(name, "budget reached", restore=True)
         elif zs["run_min"] >= z["max_run_min"]:
             self._end_session(name, "max run", restore=True)
@@ -1593,8 +1608,9 @@ class ThermalBattery(hass.Hass):
                 "probe" if probe else "charge", reason), force=probe)
             zs["restore"] = {"at": time.time(), "tries": 1, "force": probe}
         if probe:
-            self._event(name, "probe_end", "%s after %.1f min" % (
-                reason, (time.time() - sess["start"]) / 60.0))
+            self._event(name, "probe_end", "%s after %.1f min, heat %.0f" % (
+                reason, (time.time() - sess["start"]) / 60.0,
+                zs.get("probe_q", 0.0)))
             return
         self._event(name, "session_end", "%s delivered=%.0f/%s run=%.0fmin"
                     % (reason, zs["delivered"], zs.get("budget"),
@@ -1840,7 +1856,10 @@ class ThermalBattery(hass.Hass):
                 "delivered": round(s["delivered"], 1),
                 "unplanned": round(s["unplanned"], 1),
                 "unplanned_min": round(s.get("unplanned_min", 0.0), 1),
-                "budget": s["budget"], "k": round(self.k[z["name"]], 4),
+                "budget": s["budget"], "target": round(self._target(s), 1),
+                "slab_need": s.get("slab_need"),
+                "probe_q": round(s.get("probe_q", 0.0), 1),
+                "k": round(self.k[z["name"]], 4),
                 "charging": bool(s["session"]), "done": s["done"],
                 "run_min": round(s["run_min"], 1),
                 "stop_reason": s["stop_reason"], "invalid": s["invalid"],

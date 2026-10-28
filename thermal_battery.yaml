@@ -42,7 +42,9 @@ thermal_battery:
   window_latest: "19:00"    #   inside [earliest, latest]
   window_hours: 5
   min_session_min: 30       # don't start a charge with less window left
-  max_concurrent: 2         # zones charging at once
+  # Zones run at once while their summed `load` (per zone, default 1) stays
+  # <= max_load: large zones are load 2, so two of them never run together.
+  max_load: 3
   flush_min: 3              # ignore dT for this long after each call starts
   backup_cooldown_min: 20
 
@@ -120,6 +122,7 @@ thermal_battery:
         - sensor.powder_room_bdl_temperature
       k_init: 5.0
       max_run_min: 240
+      load: 2            # large zone
     - name: basement_bunk_rooms
       climate: climate.basement_bunk_rooms
       air_coarse: true   # thermostat reports whole degF
@@ -130,6 +133,7 @@ thermal_battery:
       return_entity: sensor.thermux_basement_return
       k_init: 5.0
       max_run_min: 240
+      load: 2            # large zone
     - name: master_bedroom
       climate: climate.master_bedroom
       covers:

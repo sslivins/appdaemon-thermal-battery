@@ -126,7 +126,7 @@ class ThermalBattery(hass.Hass):
         self.window_latest = _hhmm(a.get("window_latest", "19:00"))
         self.window_hours = int(a.get("window_hours", 5))
         self.min_session_min = float(a.get("min_session_min", 30))
-        self.max_concurrent = int(a.get("max_concurrent", 2))
+        self.max_load = float(a.get("max_load", 3))
         self.flush_min = float(a.get("flush_min", 8))
         self.backup_cooldown_min = float(a.get("backup_cooldown_min", 20))
         self.override_grace_s = float(a.get("override_grace_s", 120))
@@ -205,6 +205,7 @@ class ThermalBattery(hass.Hass):
                 "k_max": float(z.get("k_max", 50.0)),
                 "max_run_min": float(z.get("max_run_min", 240)),
                 "probe_min": _num(z.get("probe_min")),
+                "load": float(z.get("load", 1)),
                 "max_budget": float(z.get("max_budget", 5000)),
                 "priority": int(z.get("priority", i)),
                 # thermostat reports whole degF (coarser air reading)
@@ -1489,10 +1490,8 @@ class ThermalBattery(hass.Hass):
         if (self._backup_clear_since is None or
                 now - self._backup_clear_since < self.backup_cooldown_min * 60):
             return
-        active = sum(1 for s in live["zones"].values() if s["session"])
+        active = self._active_load()
         for z in self.zones:
-            if active >= self.max_concurrent:
-                break
             name = z["name"]
             zs = live["zones"][name]
             if zs.get("probed") or zs["session"] or zs["restore"]:
@@ -1507,12 +1506,19 @@ class ThermalBattery(hass.Hass):
             if (c["setpoint"] is None
                     or abs(c["setpoint"] - self.away_setpoint) > SP_TOL):
                 continue  # someone else is driving this zone
+            if active + z["load"] > self.max_load:
+                continue
             zs["probed"] = True
             zs["session"] = {"start": now, "set_at": now, "probe": True}
             self._apply(z, self.charge_setpoint, "probe", force=True)
             self._event(name, "probe_start", "%.0f min"
                         % (z["probe_min"] or self.probe_min))
-            active += 1
+            active += z["load"]
+
+    def _active_load(self):
+        """Sum of `load` over zones with a session (charge or probe)."""
+        return sum(z["load"] for z in self.zones
+                   if self.live["zones"][z["name"]]["session"])
 
     @staticmethod
     def _target(zs):
@@ -1537,10 +1543,8 @@ class ThermalBattery(hass.Hass):
         if (self._backup_clear_since is None or
                 now - self._backup_clear_since < self.backup_cooldown_min * 60):
             return
-        active = sum(1 for s in live["zones"].values() if s["session"])
+        active = self._active_load()
         for z in self.zones:
-            if active >= self.max_concurrent:
-                break
             if not self._is_live(z["name"]):
                 continue
             zs = live["zones"][z["name"]]
@@ -1557,13 +1561,15 @@ class ThermalBattery(hass.Hass):
             if (c["setpoint"] is None
                     or abs(c["setpoint"] - self.away_setpoint) > SP_TOL):
                 continue  # someone else is driving this zone
+            if active + z["load"] > self.max_load:
+                continue
             zs["session"] = {"start": now, "set_at": now}
             self._apply(z, self.charge_setpoint, "charge start, need %.0f"
                         % remaining)
             self._event(z["name"], "session_start",
                         "budget=%.0f target=%.0f remaining=%.0f"
                         % (zs["budget"] or 0, self._target(zs), remaining))
-            active += 1
+            active += z["load"]
 
     def _supervise(self, z, zs, c, away, backup, now):
         name = z["name"]

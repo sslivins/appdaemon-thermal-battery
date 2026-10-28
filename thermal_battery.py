@@ -1528,14 +1528,15 @@ class ThermalBattery(hass.Hass):
             if (c["setpoint"] is None
                     or abs(c["setpoint"] - self.away_setpoint) > SP_TOL):
                 continue  # someone else is driving this zone
-            if active + z["load"] > self.max_load:
+            add = self._added_load(z, zs)
+            if active + add > self.max_load:
                 continue
             zs["probed"] = True
             zs["session"] = {"start": now, "set_at": now, "probe": True}
             self._apply(z, self.charge_setpoint, "probe", force=True)
             self._event(name, "probe_start", "until hot front (max %.0f min)"
                         % self.probe_max_min)
-            active += z["load"]
+            active += add
 
     def _active_load(self):
         """Sum of `load` over zones running: our sessions (charge or probe)
@@ -1544,6 +1545,12 @@ class ThermalBattery(hass.Hass):
         return sum(z["load"] for z in self.zones
                    if self.live["zones"][z["name"]]["session"]
                    or self.live["zones"][z["name"]]["call_start"] is not None)
+
+    @staticmethod
+    def _added_load(z, zs):
+        """Load a start adds: none if the zone is already calling on its
+        own (it's in _active_load already)."""
+        return 0 if zs["call_start"] is not None else z["load"]
 
     @staticmethod
     def _target(zs):
@@ -1586,7 +1593,8 @@ class ThermalBattery(hass.Hass):
             if (c["setpoint"] is None
                     or abs(c["setpoint"] - self.away_setpoint) > SP_TOL):
                 continue  # someone else is driving this zone
-            if active + z["load"] > self.max_load:
+            add = self._added_load(z, zs)
+            if active + add > self.max_load:
                 continue
             zs["session"] = {"start": now, "set_at": now}
             self._apply(z, self.charge_setpoint, "charge start, need %.0f"
@@ -1594,7 +1602,7 @@ class ThermalBattery(hass.Hass):
             self._event(z["name"], "session_start",
                         "budget=%.0f target=%.0f remaining=%.0f"
                         % (zs["budget"] or 0, self._target(zs), remaining))
-            active += z["load"]
+            active += add
 
     def _supervise(self, z, zs, c, away, backup, now):
         name = z["name"]

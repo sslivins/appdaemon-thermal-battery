@@ -1516,9 +1516,12 @@ class ThermalBattery(hass.Hass):
             active += z["load"]
 
     def _active_load(self):
-        """Sum of `load` over zones with a session (charge or probe)."""
+        """Sum of `load` over zones running: our sessions (charge or probe)
+        plus zones calling on their own (backstop), so a start can't push
+        total load past max_load."""
         return sum(z["load"] for z in self.zones
-                   if self.live["zones"][z["name"]]["session"])
+                   if self.live["zones"][z["name"]]["session"]
+                   or self.live["zones"][z["name"]]["call_start"] is not None)
 
     @staticmethod
     def _target(zs):

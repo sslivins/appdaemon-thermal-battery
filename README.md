@@ -25,7 +25,8 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
   `window_earliest` and `window_latest`. In that block, zones are charged in
   list order (big zones first) while the zones' summed `load` stays within
   `max_load` (large zones are load 2, so two never run together; probes
-  follow the same rule). A zone
+  follow the same rule, and zones already calling on their own count too).
+  A zone
   charges by raising its thermostat to `charge_setpoint`, and is put back to
   `away_setpoint` once its budget is delivered, it hits `max_run_min`, or the
   window ends.

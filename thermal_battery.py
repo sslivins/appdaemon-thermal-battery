@@ -428,6 +428,18 @@ class ThermalBattery(hass.Hass):
             return False
         return str(self.get_state(self.backup_entity)) == "on"
 
+    def _backup_off_since(self, now):
+        """When the backup last changed state (so a restart doesn't restart
+        the cooldown); falls back to now."""
+        if not self.backup_entity:
+            return 0.0
+        try:
+            lc = self.get_state(self.backup_entity, attribute="last_changed")
+            ts = dt.datetime.fromisoformat(str(lc)).timestamp()
+        except Exception:
+            return now
+        return min(now, ts)
+
     def _read(self, entity):
         """-> (value, age_s) ; value None if unavailable."""
         st = self.get_state(entity, attribute="all") or {}
@@ -1303,7 +1315,7 @@ class ThermalBattery(hass.Hass):
         if backup:
             self._backup_clear_since = None
         elif self._backup_clear_since is None:
-            self._backup_clear_since = now
+            self._backup_clear_since = self._backup_off_since(now)
 
         sup, sup_age = self._read(self.supply_entity)
         any_flow_long = False

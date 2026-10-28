@@ -45,6 +45,7 @@ DIP_IDLE_MIN = 60             # loop idle this long before a call => dip valid
 DIP_WINDOW_MIN = 15           # search for the dip in the first N min of a call
 FRONT_PLATEAU_MIN = 25        # plateau = median return after this
 FRONT_SEARCH_MIN = 30         # look for the hot front within this
+FRONT_RISE_C = 2.0            # return this far above the dip => hot front
 NAMES = ("kas", "kao", "r", "ksg", "h", "sa", "ss")
 PRIOR = {                     # (median, log-sd)
     "kas": (0.4, 1.0),
@@ -124,7 +125,7 @@ def call_signatures(samples):
         ref = plat if plat is not None else max(
             [r[4] for r in later], default=None)
         front = None
-        if ref is not None and ref - d[4] > 2.0:
+        if ref is not None and ref - d[4] > FRONT_RISE_C:
             # hot front = steepest return rise. A 50%-to-plateau rule reads
             # late: the return keeps creeping up as the whole loop warms.
             best = 0.0

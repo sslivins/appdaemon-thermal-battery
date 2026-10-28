@@ -81,11 +81,13 @@ for a staged rollout (one zone at a time). Everything else stays in shadow.
 ### Probe runs
 
 With `probe.enabled`, every zone (dry_run zones too) gets one short call
-(`probe.minutes`, default 10; per-zone `probe_min`) in the `probe.lead_min`
-before the charging window. The first water back sat in the loop, so the
-return dip reads the slab temperature in zones without floor probes, and
-the slab model gets a fresh reading before the window-open decision. The
-probe must outlast the loop transit (basement master ~9.5 min). Zones that
+in the `probe.lead_min` before the charging window. The first water back
+sat in the loop, so the return dip reads the slab temperature in zones
+without floor probes, and the slab model gets a fresh reading before the
+window-open decision. The probe has no fixed length: it ends
+`after_front_min` after the return rises `FRONT_RISE_C` (2 °C) above its
+lowest reading, i.e. once the hot front has come round the loop, so it
+adapts to each loop's transit. `max_minutes` is only a safeguard. Zones that
 called within `recent_call_min` are skipped (that call already read the
 slab). Probe heat is kept separate (`probe_q`): it is neither delivered nor
 unplanned, so it doesn't feed `k` learning, and probes don't count toward

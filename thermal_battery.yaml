@@ -14,7 +14,8 @@ thermal_battery:
   # to the window; the first minutes of return water read the slab.
   probe:
     enabled: true
-    minutes: 10
+    max_minutes: 20         # safeguard; a probe normally ends at the hot front
+    after_front_min: 2      # keep running this long after the front arrives
     lead_min: 45            # start this long before the window opens
     recent_call_min: 90     # skip a zone that called this recently
 
@@ -159,7 +160,6 @@ thermal_battery:
       return_entity: sensor.thermux_basement_master_return_ada
       k_init: 1.0
       max_run_min: 120
-      probe_min: 15      # hot front takes ~9.5 min round this loop
     - name: ski_room
       climate: climate.ski_room
       air_coarse: true   # thermostat reports whole degF

@@ -117,7 +117,11 @@ class ThermalBattery(hass.Hass):
         # the return dip reads every slab (incl. dry_run zones) each day.
         pr = a.get("probe") or {}
         self.probe_enabled = bool(pr.get("enabled", False))
-        self.probe_min = float(pr.get("minutes", 10))
+        # A probe ends after_front_min after the return rises FRONT_RISE_C
+        # above its dip (hot front back = slab water read); max_minutes is
+        # only a safeguard.
+        self.probe_max_min = float(pr.get("max_minutes", 20))
+        self.probe_after_front_min = float(pr.get("after_front_min", 2))
         self.probe_lead_min = float(pr.get("lead_min", 45))
         self.probe_recent_min = float(pr.get("recent_call_min", 90))
         self.carry_max_min = float(a.get("carry_max_min", 240))
@@ -204,7 +208,6 @@ class ThermalBattery(hass.Hass):
                 "k_min": float(z.get("k_min", 0.0)),
                 "k_max": float(z.get("k_max", 50.0)),
                 "max_run_min": float(z.get("max_run_min", 240)),
-                "probe_min": _num(z.get("probe_min")),
                 "load": float(z.get("load", 1)),
                 "max_budget": float(z.get("max_budget", 5000)),
                 "priority": int(z.get("priority", i)),
@@ -1343,6 +1346,13 @@ class ThermalBattery(hass.Hass):
                              >= self.sensor_stale_min * 60)
             any_flow_long = any_flow_long or flow_long
             self._stale_check(z["return_entity"], ret, ret_age, flow_long)
+            sess = zs["session"]
+            if sess and sess.get("probe") and calling and ret is not None:
+                if sess.get("rmin") is None or ret < sess["rmin"]:
+                    sess["rmin"] = ret
+                if (not sess.get("front_at")
+                        and ret - sess["rmin"] >= tb_slab.FRONT_RISE_C):
+                    sess["front_at"] = now
 
             # --- heat accounting ---------------------------------------
             if (calling and dt_min > 0 and sup is not None and ret is not None
@@ -1511,8 +1521,8 @@ class ThermalBattery(hass.Hass):
             zs["probed"] = True
             zs["session"] = {"start": now, "set_at": now, "probe": True}
             self._apply(z, self.charge_setpoint, "probe", force=True)
-            self._event(name, "probe_start", "%.0f min"
-                        % (z["probe_min"] or self.probe_min))
+            self._event(name, "probe_start", "until hot front (max %.0f min)"
+                        % self.probe_max_min)
             active += z["load"]
 
     def _active_load(self):
@@ -1589,10 +1599,13 @@ class ThermalBattery(hass.Hass):
             self._invalidate(zs, "override during charge %.1f" % c["setpoint"])
             self._end_session(name, "manual override", restore=False)
             return
-        if zs["session"].get("probe"):
-            pm = z["probe_min"] or self.probe_min
-            if now - zs["session"]["start"] >= pm * 60:
-                self._end_session(name, "done", restore=True)
+        sess = zs["session"]
+        if sess.get("probe"):
+            fa = sess.get("front_at")
+            if fa and now - fa >= self.probe_after_front_min * 60:
+                self._end_session(name, "hot front", restore=True)
+            elif now - sess["start"] >= self.probe_max_min * 60:
+                self._end_session(name, "max time", restore=True)
             return
         if zs["delivered"] + zs["unplanned"] >= self._target(zs):
             self._end_session(name, "budget reached", restore=True)
@@ -1617,9 +1630,14 @@ class ThermalBattery(hass.Hass):
                 "probe" if probe else "charge", reason), force=probe)
             zs["restore"] = {"at": time.time(), "tries": 1, "force": probe}
         if probe:
-            self._event(name, "probe_end", "%s after %.1f min, heat %.0f" % (
-                reason, (time.time() - sess["start"]) / 60.0,
-                zs.get("probe_q", 0.0)))
+            fa = sess.get("front_at")
+            self._event(name, "probe_end",
+                        "%s after %.1f min, dip %s, front at %s, heat %.0f" % (
+                            reason, (time.time() - sess["start"]) / 60.0,
+                            "%.1f" % sess["rmin"] if sess.get("rmin")
+                            is not None else "-",
+                            "%.1f min" % ((fa - sess["start"]) / 60.0)
+                            if fa else "-", zs.get("probe_q", 0.0)))
             return
         self._event(name, "session_end", "%s delivered=%.0f/%s run=%.0fmin"
                     % (reason, zs["delivered"], zs.get("budget"),

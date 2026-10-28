@@ -10,6 +10,13 @@ thermal_battery:
   dry_run: true
   # Zones that charge for real anyway (staged rollout out of shadow mode).
   live_zones: [master_bedroom]
+  # Probe runs: a short call per zone (dry_run zones too) in the lead-up
+  # to the window; the first minutes of return water read the slab.
+  probe:
+    enabled: true
+    minutes: 10
+    lead_min: 45            # start this long before the window opens
+    recent_call_min: 90     # skip a zone that called this recently
 
   # Only operate while the house is in AWAY mode.
   away_entity: input_boolean.home_away_mode_enabled
@@ -148,6 +155,7 @@ thermal_battery:
       return_entity: sensor.thermux_basement_master_return_ada
       k_init: 1.0
       max_run_min: 120
+      probe_min: 15      # hot front takes ~9.5 min round this loop
     - name: ski_room
       climate: climate.ski_room
       air_coarse: true   # thermostat reports whole degF

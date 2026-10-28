@@ -75,6 +75,18 @@ way to bootstrap the model.
 `live_zones` lists zones that charge for real even while `dry_run` is on,
 for a staged rollout (one zone at a time). Everything else stays in shadow.
 
+### Probe runs
+
+With `probe.enabled`, every zone (dry_run zones too) gets one short call
+(`probe.minutes`, default 10; per-zone `probe_min`) in the `probe.lead_min`
+before the charging window. The first water back sat in the loop, so the
+return dip reads the slab temperature in zones without floor probes, and
+the slab model gets a fresh reading before the window-open decision. The
+probe must outlast the loop transit (basement master ~9.5 min). Zones that
+called within `recent_call_min` are skipped (that call already read the
+slab). Probe heat counts as delivered; probes don't count toward
+`max_run_min`. Events: `probe_start` / `probe_end` / `probe_skip`.
+
 ## Shadow predictor (`tb_model.py`)
 
 Logging only; it never changes a budget. At plan time and at

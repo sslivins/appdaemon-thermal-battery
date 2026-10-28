@@ -113,6 +113,13 @@ class ThermalBattery(hass.Hass):
         # grace after it) belong to the night that is ending: grading waits
         # for them to finish so their heat is booked to that cycle.
         self.carry_grace_min = float(a.get("carry_grace_min", 30))
+        # Probe runs: a short call per zone before the charging window so
+        # the return dip reads every slab (incl. dry_run zones) each day.
+        pr = a.get("probe") or {}
+        self.probe_enabled = bool(pr.get("enabled", False))
+        self.probe_min = float(pr.get("minutes", 10))
+        self.probe_lead_min = float(pr.get("lead_min", 45))
+        self.probe_recent_min = float(pr.get("recent_call_min", 90))
         self.carry_max_min = float(a.get("carry_max_min", 240))
         self.night_start = _hhmm(a.get("night_start", "22:00"))
         self.window_earliest = _hhmm(a.get("window_earliest", "11:00"))
@@ -197,6 +204,7 @@ class ThermalBattery(hass.Hass):
                 "k_min": float(z.get("k_min", 0.0)),
                 "k_max": float(z.get("k_max", 50.0)),
                 "max_run_min": float(z.get("max_run_min", 240)),
+                "probe_min": _num(z.get("probe_min")),
                 "max_budget": float(z.get("max_budget", 5000)),
                 "priority": int(z.get("priority", i)),
                 # thermostat reports whole degF (coarser air reading)
@@ -485,8 +493,8 @@ class ThermalBattery(hass.Hass):
     def _any_live(self):
         return not self.dry_run or bool(self.live_zones)
 
-    def _apply(self, z, temp, why):
-        if not self._is_live(z["name"]):
+    def _apply(self, z, temp, why, force=False):
+        if not (force or self._is_live(z["name"])):
             self.log("[dry_run] would set %s -> %.1fC (%s)" % (
                 z["climate"], temp, why))
             return
@@ -1311,6 +1319,8 @@ class ThermalBattery(hass.Hass):
             else:
                 self._set_problem("climate:" + name, False)
             calling = c["action"] == "heating"
+            if calling:
+                zs["last_call"] = now
             new_call = calling and zs["call_start"] is None
             if new_call:
                 zs["call_start"] = now
@@ -1319,8 +1329,10 @@ class ThermalBattery(hass.Hass):
             pz = self._carry_zone(name, calling, new_call,
                                   bool(zs["session"]), now)
             if c["available"]:
+                sess = zs["session"]
                 self._heat_watch(name, calling, c["air"],
-                                 bool(zs["session"]), now)
+                                 "probe" if sess and sess.get("probe")
+                                 else bool(sess), now)
             flow_long = bool(calling and now - zs["call_start"]
                              >= self.sensor_stale_min * 60)
             any_flow_long = any_flow_long or flow_long
@@ -1339,7 +1351,7 @@ class ThermalBattery(hass.Hass):
             if calling and dt_min > 0 and not zs["session"]:
                 acc = pz if pz is not None else zs
                 acc["unplanned_min"] = acc.get("unplanned_min", 0.0) + dt_min
-            if zs["session"]:
+            if zs["session"] and not zs["session"].get("probe"):
                 zs["run_min"] += dt_min
 
             # --- validity for learning ----------------------------------
@@ -1373,6 +1385,7 @@ class ThermalBattery(hass.Hass):
             else:
                 self._kv_set("pending_grade", p)
 
+        self._maybe_start_probes(away, backup, now)
         self._maybe_start_sessions(away, backup, now)
         if (self.slab_enabled and not self.live.get("slab_decided")
                 and self._in_window(now)):
@@ -1416,7 +1429,8 @@ class ThermalBattery(hass.Hass):
                else ", outdoor %.1f\u00b0C" % self._last_outdoor)
         if calling:
             h.update(start=at, air0=air)
-            kind = "planned charge" if planned else "backstop"
+            kind = ("probe" if planned == "probe" else
+                    "planned charge" if planned else "backstop")
             msg = "%s started heating at %s (%s): air %s%s" % (
                 label, time.strftime("%H:%M", time.localtime(at)), kind,
                 _fmt_c(air), out)
@@ -1455,6 +1469,42 @@ class ThermalBattery(hass.Hass):
         if ws is None:
             return False
         return ws <= now < we - min_left_min * 60
+
+    def _maybe_start_probes(self, away, backup, now):
+        """Short call per zone in the lead-up to the window: the first
+        minutes of return water read the slab (tb_slab dip)."""
+        live = self.live
+        ws = live.get("window_start")
+        if (not self.probe_enabled or not away or backup or ws is None
+                or not ws - self.probe_lead_min * 60 <= now < ws):
+            return
+        if (self._backup_clear_since is None or
+                now - self._backup_clear_since < self.backup_cooldown_min * 60):
+            return
+        active = sum(1 for s in live["zones"].values() if s["session"])
+        for z in self.zones:
+            if active >= self.max_concurrent:
+                break
+            name = z["name"]
+            zs = live["zones"][name]
+            if zs.get("probed") or zs["session"] or zs["restore"]:
+                continue
+            last = zs.get("last_call")
+            if last is not None and now - last < self.probe_recent_min * 60:
+                zs["probed"] = True   # a recent call already read the slab
+                self._event(name, "probe_skip", "called %.0f min ago"
+                            % ((now - last) / 60.0))
+                continue
+            c = self._climate(z)
+            if (c["setpoint"] is None
+                    or abs(c["setpoint"] - self.away_setpoint) > SP_TOL):
+                continue  # someone else is driving this zone
+            zs["probed"] = True
+            zs["session"] = {"start": now, "set_at": now, "probe": True}
+            self._apply(z, self.charge_setpoint, "probe", force=True)
+            self._event(name, "probe_start", "%.0f min"
+                        % (z["probe_min"] or self.probe_min))
+            active += 1
 
     def _maybe_start_sessions(self, away, backup, now):
         live = self.live
@@ -1515,6 +1565,11 @@ class ThermalBattery(hass.Hass):
             self._invalidate(zs, "override during charge %.1f" % c["setpoint"])
             self._end_session(name, "manual override", restore=False)
             return
+        if zs["session"].get("probe"):
+            pm = z["probe_min"] or self.probe_min
+            if now - zs["session"]["start"] >= pm * 60:
+                self._end_session(name, "done", restore=True)
+            return
         if zs["delivered"] + zs["unplanned"] >= (zs["budget"] or 0):
             self._end_session(name, "budget reached", restore=True)
         elif zs["run_min"] >= z["max_run_min"]:
@@ -1525,21 +1580,30 @@ class ThermalBattery(hass.Hass):
     def _end_session(self, name, reason, restore=True, done=True):
         z = self.zmap[name]
         zs = self.live["zones"][name]
-        if not zs.get("session"):
+        sess = zs.get("session")
+        if not sess:
             return
+        probe = bool(sess.get("probe"))
         zs["session"] = None
-        zs["done"] = done
-        zs["stop_reason"] = reason
+        if not probe:
+            zs["done"] = done
+            zs["stop_reason"] = reason
         if restore:
-            self._apply(z, self.away_setpoint, "charge end: " + reason)
-            zs["restore"] = {"at": time.time(), "tries": 1}
+            self._apply(z, self.away_setpoint, "%s end: %s" % (
+                "probe" if probe else "charge", reason), force=probe)
+            zs["restore"] = {"at": time.time(), "tries": 1, "force": probe}
+        if probe:
+            self._event(name, "probe_end", "%s after %.1f min" % (
+                reason, (time.time() - sess["start"]) / 60.0))
+            return
         self._event(name, "session_end", "%s delivered=%.0f/%s run=%.0fmin"
                     % (reason, zs["delivered"], zs.get("budget"),
                        zs["run_min"]))
 
     def _verify_restore(self, z, zs, c, now):
         r = zs["restore"]
-        if not self._is_live(z["name"]) or c["setpoint"] is None:
+        if (not (r.get("force") or self._is_live(z["name"]))
+                or c["setpoint"] is None):
             zs["restore"] = None
             return
         if abs(c["setpoint"] - self.away_setpoint) <= SP_TOL:
@@ -1557,17 +1621,17 @@ class ThermalBattery(hass.Hass):
                               "(still %.1fC)." % (z["climate"],
                                                   self.away_setpoint,
                                                   r["tries"], c["setpoint"]))
-        self._apply(z, self.away_setpoint, "restore retry")
+        self._apply(z, self.away_setpoint, "restore retry",
+                    force=r.get("force", False))
         r["at"] = now
         r["tries"] += 1
 
     def _recover_stuck_setpoints(self):
-        """After a crash, put zones we were charging back to baseline."""
-        if not self._any_live() or not self._is_away():
+        """After a crash, put zones we were charging/probing back to
+        baseline (sessions only exist for live zones and probes)."""
+        if not self._is_away():
             return
         for z in self.zones:
-            if not self._is_live(z["name"]):
-                continue
             zs = self.live["zones"][z["name"]]
             if zs.get("session"):
                 zs["session"] = None
@@ -1575,8 +1639,10 @@ class ThermalBattery(hass.Hass):
                 c = self._climate(z)
                 if (c["setpoint"] is not None and
                         abs(c["setpoint"] - self.charge_setpoint) <= SP_TOL):
-                    self._apply(z, self.away_setpoint, "startup recovery")
-                    zs["restore"] = {"at": time.time(), "tries": 1}
+                    self._apply(z, self.away_setpoint, "startup recovery",
+                                force=True)
+                    zs["restore"] = {"at": time.time(), "tries": 1,
+                                     "force": True}
                 self._event(z["name"], "startup_recovery", "")
         self._save_live()
 

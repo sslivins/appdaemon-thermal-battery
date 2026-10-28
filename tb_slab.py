@@ -22,7 +22,8 @@ a running estimate from everything that sees it:
     floor surface sensors     where a zone has them
     return-water dip          first minutes of every call: the water that sat
                               in the loop comes back at slab temperature
-                              before the hot front has made it round
+                              before the hot front has made it round (daily
+                              probe runs make sure every zone gets one)
 
 Each call also yields the loop transit time (call start to the steepest rise
 of the return, i.e. when the hot front reaches the return probe); it bounds
@@ -118,8 +119,12 @@ def call_signatures(samples):
         later = [r for r in run if r[0] > d[0]]
         plat = _median([r[4] for r in later
                         if r[0] - t0 >= FRONT_PLATEAU_MIN * 60])
+        # short calls (probe runs) end before the plateau window: use the
+        # warmest return seen so the hot front can still be found
+        ref = plat if plat is not None else max(
+            [r[4] for r in later], default=None)
         front = None
-        if plat is not None and plat - d[4] > 2.0:
+        if ref is not None and ref - d[4] > 2.0:
             # hot front = steepest return rise. A 50%-to-plateau rule reads
             # late: the return keeps creeping up as the whole loop warms.
             best = 0.0

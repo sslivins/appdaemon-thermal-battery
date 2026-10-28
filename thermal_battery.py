@@ -283,7 +283,8 @@ class ThermalBattery(hass.Hass):
             if self.live:
                 for name, zs in self.live["zones"].items():
                     if zs.get("session"):
-                        self._end_session(name, "terminate", restore=True)
+                        self._end_session(name, "terminate", restore=True,
+                                          done=False)
                 self._save_live()
         except Exception as exc:  # noqa: BLE001
             self.log("terminate restore failed: %s" % exc, level="ERROR")
@@ -643,6 +644,11 @@ class ThermalBattery(hass.Hass):
             for z in self.zones:
                 self.live["zones"].setdefault(
                     z["name"], self._new_live(cs, True)["zones"][z["name"]])
+            # a reload isn't a reason to stop charging for the day
+            for zs in self.live["zones"].values():
+                if zs.get("stop_reason") == "terminate":
+                    zs["done"] = False
+                    zs["stop_reason"] = None
             if self.live.get("plan_hdh") is None:
                 self._make_plan(retry=True)
             self._event(None, "resume_cycle", cid)

@@ -28,7 +28,8 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
   follow the same rule, and zones already calling on their own count too).
   A zone
   charges by raising its thermostat to `charge_setpoint`, and is put back to
-  `away_setpoint` once its budget is delivered, it hits `max_run_min`, or the
+  `away_setpoint` once its budget is delivered, it hits `max_run_min`
+  (optional per zone; defaults to the window length), or the
   window ends.
 - **Backstop.** Outside charging, thermostats sit at `away_setpoint` (12 °C).
   Any heat they add on their own is recorded as **unplanned**.

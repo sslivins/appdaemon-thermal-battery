@@ -48,6 +48,17 @@ thermal_battery:
   max_load: 3
   flush_min: 3              # ignore dT for this long after each call starts
   backup_cooldown_min: 20
+  # Raise the ECO-600 tank target while a live zone charges and the slab
+  # model says it can't get its full charge at the normal tank temperature.
+  # Stepped up to stay within max_ahead_c of the tank (the backup fires at
+  # 8 C below target for 30 min); put back to `normal` afterwards.
+  tank_boost:
+    enabled: true
+    target_entity: number.aeco_1988_hot_tank_target_temperature
+    tank_entity: sensor.aeco_1988_tank_temperature
+    normal: 27.8
+    temp: 35.0
+    max_ahead_c: 6.0
 
   learn_alpha: 0.3          # k += alpha * (k_obs - k)
   max_step_frac: 0.25       # max daily k change

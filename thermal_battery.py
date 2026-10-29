@@ -133,6 +133,19 @@ class ThermalBattery(hass.Hass):
         self.max_load = float(a.get("max_load", 3))
         self.flush_min = float(a.get("flush_min", 8))
         self.backup_cooldown_min = float(a.get("backup_cooldown_min", 20))
+        # Tank boost: while a live zone charges and the slab model said it
+        # can't get its full charge at normal tank temperature, raise the
+        # tank target (stepping, never more than max_ahead_c above the tank,
+        # so the backup's differential can't trip). Restored afterwards.
+        tb = a.get("tank_boost") or {}
+        self.boost_entity = tb.get("target_entity")
+        self.boost_tank_entity = tb.get("tank_entity")
+        self.boost_enabled = bool(tb.get("enabled", False)
+                                  and self.boost_entity
+                                  and self.boost_tank_entity)
+        self.boost_temp = float(tb.get("temp", 35.0))
+        self.boost_normal = float(tb.get("normal", 27.8))
+        self.boost_ahead = float(tb.get("max_ahead_c", 6.0))
         self.override_grace_s = float(a.get("override_grace_s", 120))
 
         self.learn_alpha = float(a.get("learn_alpha", 0.3))
@@ -286,6 +299,9 @@ class ThermalBattery(hass.Hass):
                     if zs.get("session"):
                         self._end_session(name, "terminate", restore=True,
                                           done=False)
+                if self.boost_enabled and self.live.get("boost_active"):
+                    # tick restores (and confirms) after reload too
+                    self._set_tank_target(self.boost_normal, "terminate")
                 self._save_live()
         except Exception as exc:  # noqa: BLE001
             self.log("terminate restore failed: %s" % exc, level="ERROR")
@@ -659,7 +675,10 @@ class ThermalBattery(hass.Hass):
         if self.live:
             self._event(None, "late_grade", self.live.get("cycle_id"))
             self._grade()
+        owe = bool(self.live and self.live.get("boost_active"))
         self.live = self._new_live(cs, partial=True)
+        if owe:
+            self.live["boost_active"] = True
         self._make_plan()
 
     def _on_grade_time(self, kwargs):
@@ -675,6 +694,8 @@ class ThermalBattery(hass.Hass):
                 if zs.get("session"):
                     self._end_session(name, "grade", restore=True)
         self.live = self._new_live(cs, partial=False)
+        if old and old.get("boost_active"):
+            self.live["boost_active"] = True   # still owe a restore
         held = []
         if old:
             for name, zs in old["zones"].items():
@@ -976,6 +997,7 @@ class ThermalBattery(hass.Hass):
                      json.dumps([round(v, 4) for v in x]), json.dumps(p)))
                 self._db.commit()
             zs["slab_need"] = round(need, 1)
+            zs["capped"] = bool(capped)
             charge = ""
             if self._is_live(name) and need > k_left:
                 zs["target"] = zs["delivered"] + zs["unplanned"] + need
@@ -1432,6 +1454,10 @@ class ThermalBattery(hass.Hass):
             except Exception as exc:  # noqa: BLE001
                 self.log("slab decision failed: %s" % exc, level="WARNING")
         self._maybe_start_sessions(away, backup, now)
+        try:
+            self._tank_boost(away, backup, now)
+        except Exception as exc:  # noqa: BLE001
+            self.log("tank boost failed: %s" % exc, level="WARNING")
         self._stale_check(self.supply_entity, sup, sup_age, any_flow_long)
 
         if samples:
@@ -1610,6 +1636,43 @@ class ThermalBattery(hass.Hass):
                         "budget=%.0f target=%.0f remaining=%.0f"
                         % (zs["budget"] or 0, self._target(zs), remaining))
             active += add
+
+    def _tank_boost(self, away, backup, now):
+        if not self.boost_enabled:
+            return
+        live = self.live
+        want = self.boost_normal
+        if (away and not backup and self._in_window(now) and any(
+                zs["session"] and not zs["session"].get("probe")
+                and zs.get("capped") for zs in live["zones"].values())):
+            tank, age = self._read(self.boost_tank_entity)
+            if tank is not None and age is not None and age < 900:
+                want = max(self.boost_normal,
+                           min(self.boost_temp, tank + self.boost_ahead))
+        if want <= self.boost_normal and not live.get("boost_active"):
+            return    # never raised it: leave the tank target alone
+        cur, _ = self._read(self.boost_entity)
+        if cur is not None:
+            if want <= self.boost_normal:
+                if abs(cur - want) < 0.25:
+                    live["boost_active"] = False
+                    self._event(None, "tank_restore", "confirmed %.1f" % cur)
+                    return
+            elif abs(cur - want) < (0.25 if want >= self.boost_temp
+                                    else 1.0):
+                return    # close enough while stepping up
+        last = live.get("boost_set")
+        if last and abs(last[0] - want) < 0.25 and now - last[1] < 300:
+            return    # wait for the write to show up before retrying
+        self._set_tank_target(want, "tank %s" % (
+            "%.1f" % tank if want > self.boost_normal else "-"))
+        live["boost_set"] = [want, now]
+        live["boost_active"] = True
+
+    def _set_tank_target(self, value, why):
+        self.call_service("number/set_value", entity_id=self.boost_entity,
+                          value=round(value, 1))
+        self._event(None, "tank_target", "%.1f (%s)" % (value, why))
 
     def _supervise(self, z, zs, c, away, backup, now):
         name = z["name"]

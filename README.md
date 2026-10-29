@@ -31,6 +31,15 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
   `away_setpoint` once its budget is delivered, it hits `max_run_min`
   (optional per zone; defaults to the window length), or the
   window ends.
+- **Tank boost** (`tank_boost`). The radiant supply is the buffer tank, so
+  a hotter tank charges faster at a lower COP (about 10% at 35 °C vs 28 °C).
+  While a live zone charges and the window-open slab decision said it was
+  capped (can't get its full charge), the ECO-600 tank target is raised
+  toward `temp`, never more than `max_ahead_c` above the tank so the
+  backup's differential can't trip. It is put back to `normal` when no
+  capped zone is charging, on home mode, backup, window end or reload, and
+  retried until the ECO-600 confirms. Events: `tank_target`,
+  `tank_restore`.
 - **Backstop.** Outside charging, thermostats sit at `away_setpoint` (12 °C).
   Any heat they add on their own is recorded as **unplanned**.
 - **Grading** happens every morning at `grade_time` and covers the previous

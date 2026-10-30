@@ -997,14 +997,16 @@ class ThermalBattery(hass.Hass):
                      json.dumps([round(v, 4) for v in x]), json.dumps(p)))
                 self._db.commit()
             zs["slab_need"] = round(need, 1)
-            zs["capped"] = bool(capped)
+            k_capped = k_left > cap
+            zs["capped"] = bool(capped) or k_capped
             charge = ""
             if self._is_live(name) and need > k_left:
                 zs["target"] = zs["delivered"] + zs["unplanned"] + need
                 charge = " -> charge %.0f" % need
-            parts.append("%s: slab %.0f%s vs k %.0f (Ts %.1f, low %.1f->%.1f)%s"
+            parts.append("%s: slab %.0f%s vs k %.0f%s (Ts %.1f, low %.1f->%.1f)%s"
                          % (name, need, " CAPPED" if capped else "", k_left,
-                            x[1], l0, l1, charge))
+                            " CAPPED" if k_capped else "", x[1], l0, l1,
+                            charge))
         self._event(None, "slab_decision", "%s target %.1f | %s" % (
             live["cycle_id"], self.target_low, " | ".join(parts)))
 
@@ -1218,11 +1220,10 @@ class ThermalBattery(hass.Hass):
             capacity_limited = zs.get("stop_reason") in ("max run",
                                                           "window end")
             if learned:
+                # needed includes the backstop heat, so it is the zone's real
+                # loss even when the charge was cut short by the window.
                 k_obs = needed / actual_hdh
-                if capacity_limited and k_obs > k_before:
-                    # Couldn't deliver the budget anyway - raising k would
-                    # just wind up. Hold, and report it.
-                    k_obs = k_before
+                if capacity_limited:
                     reasons.append("capacity-limited")
                 k_new = k_before + self.learn_alpha * (k_obs - k_before)
                 if k_before > 0:

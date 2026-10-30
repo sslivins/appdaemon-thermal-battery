@@ -68,8 +68,9 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
   - Learning is skipped on mild days, partial cycles, home mode, or manual
     setpoint changes.
   - If a zone couldn't deliver its budget (it hit max run or the window end),
-    `k` is not raised. This prevents wind-up, and the grade reports
-    "capacity-limited".
+    the grade reports "capacity-limited" but still learns: `needed` includes
+    the backstop heat, so it is the zone's real loss. A `k` budget too big for
+    the window marks the zone capped, which turns on the tank boost.
   - **Morning carry.** A backstop call that is running at `grade_time`, or
     starts within `carry_grace_min` (30) after it, is covering the night that
     just ended. The new cycle starts on time (plan and prediction at

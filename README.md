@@ -80,7 +80,9 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
     today's budgets are re-sized with the new `k` (`rebudget`) for zones that
     haven't charged yet. The grade is forced after `carry_max_min` (240).
 - **Electric backup.** While the backup runs, charging pauses and setpoints are
-  restored. Charging resumes after `backup_cooldown_min`.
+  restored. Charging resumes after `backup_cooldown_min`. The cooldown counts
+  from when the app last saw the backup on, so an HA restart (which resets
+  the entity's `last_changed`) doesn't restart it.
 
 `dry_run: true` (the default) never touches a setpoint. It logs what it would
 charge, and it still learns `k` from the backstop-only heat, which is a good

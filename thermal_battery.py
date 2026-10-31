@@ -253,6 +253,7 @@ class ThermalBattery(hass.Hass):
         self._last_tick = None
         self._last_sample = 0
         self._backup_clear_since = None
+        self._backup_seen_on = None
         self._started = False
 
         # --- MQTT ---------------------------------------------------------
@@ -448,9 +449,22 @@ class ThermalBattery(hass.Hass):
 
     def _backup_off_since(self, now):
         """When the backup last changed state (so a restart doesn't restart
-        the cooldown); falls back to now."""
+        the cooldown); falls back to now. An HA restart resets last_changed,
+        so if our own samples show we were watching through the whole
+        cooldown and never saw the backup on, use when we last saw it."""
         if not self.backup_entity:
             return 0.0
+        span = self.backup_cooldown_min * 60
+        last_on = float(self._kv_get("backup_last_on") or 0)
+        if last_on < now - span:
+            with self._db_lock:
+                ts = [r[0] for r in self._db.execute(
+                    "SELECT DISTINCT ts FROM samples WHERE ts >= ?"
+                    " ORDER BY ts", (now - span - 300,))]
+            pts = ts + [now]
+            if (ts and ts[0] <= now - span + 300 and
+                    max(b - a for a, b in zip(pts, pts[1:])) <= 300):
+                return last_on
         try:
             lc = self.get_state(self.backup_entity, attribute="last_changed")
             ts = dt.datetime.fromisoformat(str(lc)).timestamp()
@@ -1344,6 +1358,9 @@ class ThermalBattery(hass.Hass):
         backup = self._backup_on()
         if backup:
             self._backup_clear_since = None
+            if now - (self._backup_seen_on or 0) >= 60:
+                self._backup_seen_on = now
+                self._kv_set("backup_last_on", now)
         elif self._backup_clear_since is None:
             self._backup_clear_since = self._backup_off_since(now)
 

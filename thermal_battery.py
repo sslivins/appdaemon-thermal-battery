@@ -55,6 +55,8 @@ except ImportError:  # pragma: no cover
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 SP_TOL = 0.3  # setpoint comparison tolerance (C)
+# Bump when the slab model's units/inputs change: older fits refit at start.
+SLAB_FIT_VERSION = 2
 
 
 def _num(v):
@@ -287,9 +289,11 @@ class ThermalBattery(hass.Hass):
         self._recover_stuck_setpoints()
         self._started = True
         if self.slab_enabled:
-            stale = [z["name"] for z in self.zones if time.time() - (
-                self._slab_params.get(z["name"]) or {}).get("ts", 0)
-                > 20 * 3600]
+            stale = [z["name"] for z in self.zones
+                     if (self._slab_params.get(z["name"]) or {}).get("v")
+                     != SLAB_FIT_VERSION
+                     or time.time() - (self._slab_params.get(z["name"])
+                                       or {}).get("ts", 0) > 20 * 3600]
             if stale:
                 self._slab_refit_async()
 
@@ -917,7 +921,7 @@ class ThermalBattery(hass.Hass):
                 p, cost, n = tb_slab.fit(steps, z["air_coarse"], start=prev)
                 self._slab_params[name] = {
                     "p": {k: round(v, 6) for k, v in p.items()},
-                    "ts": int(now), "n": n}
+                    "ts": int(now), "n": n, "v": SLAB_FIT_VERSION}
                 self.log("slab fit %s: %s (n=%d, %.1fs)" % (
                     name, " ".join("%s=%.3g" % (k, v) for k, v in p.items()),
                     n, time.time() - t0))

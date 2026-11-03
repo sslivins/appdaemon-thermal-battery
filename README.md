@@ -205,8 +205,18 @@ window opens, the slab model makes its own decision (logged only):
 - it simulates charging from now at the zone's typical rate (75th
   percentile of past heat per 30 min), with the latest forecast
 - it finds the smallest charge (C·min, same units as the budget) that keeps
-  the night's low (from `night_start`) at or above `target_low`, capped by
-  the window and `max_run_min`
+  the night's low (from `night_start`) at or above `target_low` + the zone's
+  margin, capped by the window and `max_run_min`
+
+The margin covers the model's own error: per zone, the `margin.quantile` of
+`hind_low - actual_low` (how optimistic it was, below) over the last
+`margin.days`, kept in `[0, margin.max_c]` (`margin.default_c` until a zone
+has `margin.min_n` scored nights). Overshoot for `k` learning is judged
+against the same raised aim.
+
+Heat per sample is weighted by the real time to the next sample, as in the
+app's delivered accounting, so model need and delivered heat are in the
+same units whatever the sample spacing.
 
 Each zone's result goes to the `decisions` table and a `slab_decision`
 event, next to the `k` budget still left. At grade, the model is re-run from

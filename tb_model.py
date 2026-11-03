@@ -48,6 +48,14 @@ def _interp(times, vals, t):
     return a + (b - a) * (t - times[i]) / float(times[i + 1] - times[i])
 
 
+def _sample_dt(stimes, i, sample_min):
+    """Minutes sample i stands for: the real gap to the next sample (the
+    app weights delivered heat by elapsed time), capped at 3x nominal."""
+    if i + 1 < len(stimes):
+        return min((stimes[i + 1] - stimes[i]) / 60.0, 3 * sample_min)
+    return sample_min
+
+
 def build_steps(samples, weather, start, end, sample_min=1.0):
     """samples: [(ts, air, calling, supply, ret, away[, outdoor])] sorted by
     ts. weather: [(hour_ts, temp, gti)] sorted. Steps cover [start, end).
@@ -67,9 +75,9 @@ def build_steps(samples, weather, start, end, sample_min=1.0):
         outs = [s[6] for s in chunk if len(s) > 6 and s[6] is not None]
         q = 0.0
         away = True
-        for s in chunk:
+        for i, s in enumerate(chunk, lo):
             if s[2] and s[3] is not None and s[4] is not None:
-                q += max(0.0, s[3] - s[4]) * sample_min
+                q += max(0.0, s[3] - s[4]) * _sample_dt(stimes, i, sample_min)
             if s[5] is not None and not s[5]:
                 away = False
         gti = _interp(wt, wI, t + STEP / 2)

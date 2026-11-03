@@ -194,6 +194,15 @@ class ThermalBattery(hass.Hass):
         # Second shadow predictor: two-node air + slab model with a Kalman
         # filter (tb_slab). Refit daily in a background thread.
         self.slab_enabled = bool(p.get("slab", True))
+        # Slab charges aim for target_low + a per-zone margin: the
+        # `quantile` of how optimistic the model's hindcasts were
+        # (hind_low - actual_low) over the last `days`.
+        m = a.get("margin", {}) or {}
+        self.margin_quantile = float(m.get("quantile", 0.8))
+        self.margin_days = float(m.get("days", 21))
+        self.margin_min_n = int(m.get("min_n", 5))
+        self.margin_default = float(m.get("default_c", 0.5))
+        self.margin_max = float(m.get("max_c", 1.0))
         self._slab_params = {}
         self._slab_busy = False
         # Push via another HA instance's REST API (e.g. the home HA that has
@@ -991,8 +1000,11 @@ class ThermalBattery(hass.Hass):
             rate = tb_slab.charge_rate(hist) or 200.0
             cap = min(rate * max(0.0, we - t_now) / step,
                       rate * z["max_run_min"] * 60 / step)
+            margin, n_err = self._margin(name, now)
+            zs["margin"] = round(margin, 2)
+            target = self.target_low + margin
             res = tb_slab.required_charge(p, x, future, t_now, we, rate, cap,
-                                          self.target_low, ns, ce)
+                                          target, ns, ce)
             if res is None:
                 parts.append("%s: no night steps" % name)
                 continue
@@ -1005,7 +1017,7 @@ class ThermalBattery(hass.Hass):
                     " issued_ts, target, slab_t, k_left, slab_need, capped,"
                     " low_none, low_with, rate, state, params) VALUES"
                     " (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (live["cycle_id"], name, t_now, self.target_low,
+                    (live["cycle_id"], name, t_now, round(target, 2),
                      round(x[1], 2), round(k_left, 1), round(need, 1),
                      int(capped), round(l0, 2), round(l1, 2), round(rate, 1),
                      json.dumps([round(v, 4) for v in x]), json.dumps(p)))
@@ -1017,12 +1029,28 @@ class ThermalBattery(hass.Hass):
             if self._is_live(name) and need > k_left:
                 zs["target"] = zs["delivered"] + zs["unplanned"] + need
                 charge = " -> charge %.0f" % need
-            parts.append("%s: slab %.0f%s vs k %.0f%s (Ts %.1f, low %.1f->%.1f)%s"
+            parts.append("%s: slab %.0f%s vs k %.0f%s (Ts %.1f, low %.1f->%.1f,"
+                         " margin %.2f n=%d)%s"
                          % (name, need, " CAPPED" if capped else "", k_left,
                             " CAPPED" if k_capped else "", x[1], l0, l1,
-                            charge))
+                            margin, n_err, charge))
         self._event(None, "slab_decision", "%s target %.1f | %s" % (
             live["cycle_id"], self.target_low, " | ".join(parts)))
+
+    def _margin(self, name, now):
+        """-> (margin C, n errors): how far above target_low to size a slab
+        charge, from the zone's recent hindcast optimism."""
+        with self._db_lock:
+            rows = self._db.execute(
+                "SELECT hind_low - actual_low FROM decisions WHERE zone=?"
+                " AND issued_ts>=? AND hind_low IS NOT NULL AND actual_low"
+                " IS NOT NULL", (name, int(now - self.margin_days * 86400))
+            ).fetchall()
+        errs = sorted(r[0] for r in rows)
+        if len(errs) < self.margin_min_n:
+            return min(self.margin_max, self.margin_default), len(errs)
+        q = errs[int(round(self.margin_quantile * (len(errs) - 1)))]
+        return min(self.margin_max, max(0.0, q)), len(errs)
 
     def _score_decisions(self, cycle_id, cs, ce):
         """Re-run each decision's model from its stored state with the heat
@@ -1207,13 +1235,15 @@ class ThermalBattery(hass.Hass):
             unplanned_min = zs.get("unplanned_min", 0.0)
             needed = delivered + unplanned
             overshoot = False
+            # the margin is a deliberate overshoot of target_low
+            aim = self.target_low + (zs.get("margin") or 0.0)
             if (unplanned < self.unplanned_eps
                     and unplanned_min < self.unplanned_min_eps
                     and low is not None
-                    and low > self.target_low + self.overshoot_deadband):
+                    and low > aim + self.overshoot_deadband):
                 overshoot = True
                 needed *= max(0.5, 1.0 - self.overshoot_frac_per_c *
-                              (low - self.target_low))
+                              (low - aim))
             k_before = self.k[name]
             k_after = k_before
             reasons = list(zs.get("invalid", []))
@@ -1366,7 +1396,9 @@ class ThermalBattery(hass.Hass):
 
         sup, sup_age = self._read(self.supply_entity)
         any_flow_long = False
-        do_sample = now - self._last_sample >= self.sample_s
+        # half a tick of slack: ticks jitter, and a strict >= turned a 60 s
+        # sample interval into 90 s
+        do_sample = now - self._last_sample >= self.sample_s - self.tick_s / 2
         if do_sample:
             self._last_sample = now
         lux = (_num(self.get_state(self.lux_entity))

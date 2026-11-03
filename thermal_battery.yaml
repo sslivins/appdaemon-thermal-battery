@@ -31,6 +31,16 @@ thermal_battery:
   away_setpoint: 12.0       # thermostat baseline / backstop
   charge_setpoint: 22.0     # setpoint used to force a zone call while charging
   target_low: 12.5          # desired overnight-to-morning air low
+  # Slab charges are sized to target_low + margin. Per zone, margin = this
+  # quantile of how optimistic the model's hindcast lows were vs the actual
+  # lows (hind_low - actual_low) over the last `days`, kept in [0, max_c];
+  # default_c until a zone has min_n scored nights.
+  margin:
+    quantile: 0.8
+    days: 21
+    min_n: 5
+    default_c: 0.5
+    max_c: 1.0
   overshoot_deadband_c: 0.5 # low above target+this (and no backstop) => overshoot
   overshoot_frac_per_c: 0.15
   unplanned_eps: 20         # C*min of backstop heat treated as "none"

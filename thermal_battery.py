@@ -2006,8 +2006,17 @@ class ThermalBattery(hass.Hass):
             state = "idle"
         fmt = (lambda ts: dt.datetime.fromtimestamp(ts, self.tz).isoformat()
                if ts else None)
+        # True once home mode has ended every session/probe, every restore
+        # is confirmed and the tank target is back to normal: other apps
+        # (bdl_modes) wait for this before writing setpoints.
+        quiesced = (not self._is_away() and not charging
+                    and not any(s["restore"]
+                                for s in live["zones"].values())
+                    and not (self.boost_enabled
+                             and live.get("boost_active")))
         self._pub(b + "/status/state", state)
         self._pub(b + "/status/attr", {
+            "quiesced": quiesced,
             "cycle_id": live["cycle_id"], "partial": live.get("partial"),
             "plan_hdh": live.get("plan_hdh"),
             "plan_solar_kwh_m2": live.get("plan_solar"),

@@ -263,6 +263,10 @@ restarts don't send pushes. Each push is also logged as a
 ## Entities (MQTT discovery)
 
 - `sensor.thermal_battery_status`: `dry_run` / `idle` / `charging` / `home`.
+  Attribute `quiesced` is true once home mode has ended every session, every
+  setpoint restore is confirmed and the tank boost is back to normal.
+  [bdl_modes](https://github.com/sslivins/appdaemon-bdl-modes) waits for it
+  before writing thermostats.
   Attributes: plan, window, last grade.
 - `sensor.thermal_battery_<zone>_charge`: delivered heat today. Attributes:
   budget, unplanned, k, session state.

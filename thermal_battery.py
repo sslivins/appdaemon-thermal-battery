@@ -200,11 +200,17 @@ class ThermalBattery(hass.Hass):
         # `quantile` of how optimistic the model's hindcasts were
         # (hind_low - actual_low) over the last `days`.
         m = a.get("margin", {}) or {}
-        self.margin_quantile = float(m.get("quantile", 0.8))
+        self.margin_quantile = float(m.get("quantile", 0.9))
         self.margin_days = float(m.get("days", 21))
         self.margin_min_n = int(m.get("min_n", 5))
         self.margin_default = float(m.get("default_c", 0.5))
         self.margin_max = float(m.get("max_c", 1.0))
+        # Live zones charge what the slab model says they need (re-decided
+        # every `slab_replan_min` in the window); the k budget is only the
+        # fallback when a zone has no usable slab decision. A need below
+        # `min_charge` C*min isn't worth a call.
+        self.slab_replan_min = float(a.get("slab_replan_min", 30))
+        self.min_charge = float(a.get("min_charge", 20.0))
         self._slab_params = {}
         self._slab_busy = False
         # Push via another HA instance's REST API (e.g. the home HA that has
@@ -974,10 +980,14 @@ class ThermalBattery(hass.Hass):
         lows = [a for (a, _), r in zip(sim, future) if m0 <= r["t"] < ce]
         return (min(lows), x[1]) if lows else None
 
-    def _slab_decide(self, now):
-        """Shadow: at window open, size each zone's charge with the slab
-        model (smallest charge keeping the night low >= target_low) and log
-        it next to the k budget still left. Never drives the thermostats."""
+    def _slab_decide(self, now, replan=False):
+        """Size each zone's charge with the slab model: the smallest charge
+        from now that keeps the night low >= target_low + margin, from the
+        filtered air/slab state (so a warm room or slab, sun and earlier
+        heat all count) and the latest forecast. Live zones charge exactly
+        this (zero included); the k budget is only the fallback. The first
+        decision of the cycle is stored in `decisions` for scoring;
+        replans only log."""
         live = self.live
         cs = dt.datetime.fromtimestamp(live["cycle_start"], self.tz)
         ce = (cs + dt.timedelta(days=1)).timestamp()
@@ -1015,31 +1025,48 @@ class ThermalBattery(hass.Hass):
             need, l0, l1, capped = res
             k_left = max(0.0, (zs["budget"] or 0) - zs["delivered"]
                          - zs["unplanned"])
-            with self._db_lock:
-                self._db.execute(
-                    "INSERT OR REPLACE INTO decisions (cycle_id, zone,"
-                    " issued_ts, target, slab_t, k_left, slab_need, capped,"
-                    " low_none, low_with, rate, state, params) VALUES"
-                    " (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (live["cycle_id"], name, t_now, round(target, 2),
-                     round(x[1], 2), round(k_left, 1), round(need, 1),
-                     int(capped), round(l0, 2), round(l1, 2), round(rate, 1),
-                     json.dumps([round(v, 4) for v in x]), json.dumps(p)))
-                self._db.commit()
+            if not replan:
+                with self._db_lock:
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO decisions (cycle_id, zone,"
+                        " issued_ts, target, slab_t, k_left, slab_need,"
+                        " capped, low_none, low_with, rate, state, params)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (live["cycle_id"], name, t_now, round(target, 2),
+                         round(x[1], 2), round(k_left, 1), round(need, 1),
+                         int(capped), round(l0, 2), round(l1, 2),
+                         round(rate, 1),
+                         json.dumps([round(v, 4) for v in x]),
+                         json.dumps(p)))
+                    self._db.commit()
+            # Heat since t_now isn't in the filtered state: count it
+            # against this need.
+            mark = zs.get("heat_mark")
+            base = (mark[1] if mark and mark[0] == t_now
+                    else zs.get("heat", 0.0))
+            zs["slab"] = {"need": round(need, 1), "base": round(base, 1),
+                          "ts": now}
             zs["slab_need"] = round(need, 1)
-            k_capped = k_left > cap
-            zs["capped"] = bool(capped) or k_capped
+            zs["capped"] = bool(capped)
             charge = ""
-            if self._is_live(name) and need > k_left:
-                zs["target"] = zs["delivered"] + zs["unplanned"] + need
-                charge = " -> charge %.0f" % need
-            parts.append("%s: slab %.0f%s vs k %.0f%s (Ts %.1f, low %.1f->%.1f,"
+            if self._is_live(name):
+                left = self._remaining(zs)
+                charge = (" -> charge %.0f" % left if left > self.min_charge
+                          else " -> none")
+                if (left > self.min_charge and zs["done"]
+                        and zs["stop_reason"] in ("no need",
+                                                  "budget reached")):
+                    zs["done"] = False
+                    zs["stop_reason"] = None
+                    charge += " (reopened)"
+            parts.append("%s: slab %.0f%s vs k %.0f (Ts %.1f, low %.1f->%.1f,"
                          " margin %.2f n=%d)%s"
                          % (name, need, " CAPPED" if capped else "", k_left,
-                            " CAPPED" if k_capped else "", x[1], l0, l1,
-                            margin, n_err, charge))
-        self._event(None, "slab_decision", "%s target %.1f | %s" % (
-            live["cycle_id"], self.target_low, " | ".join(parts)))
+                            x[1], l0, l1, margin, n_err, charge))
+        self._event(None, "slab_replan" if replan else "slab_decision",
+                    "%s target %.1f | %s" % (live["cycle_id"],
+                                             self.target_low,
+                                             " | ".join(parts)))
 
     def _margin(self, name, now):
         """-> (margin C, n errors): how far above target_low to size a slab
@@ -1279,6 +1306,13 @@ class ThermalBattery(hass.Hass):
                     hi = k_before * (1 + self.max_step_frac)
                     k_new = min(max(k_new, lo), hi)
                 k_after = min(max(k_new, z["k_min"]), z["k_max"])
+                # The slab model sized today's charge, so a small delivery
+                # says nothing about the zone's loss: only let backstop heat
+                # raise the fallback k.
+                if (zs.get("slab") and self._is_live(name)
+                        and k_after < k_before):
+                    k_after = k_before
+                    reasons.append("slab-controlled: k held")
                 self.k[name] = k_after
                 self._save_k(name, k_after)
             reason = "; ".join(reasons) if reasons else (
@@ -1450,6 +1484,14 @@ class ThermalBattery(hass.Hass):
                     sess["front_at"] = now
 
             # --- heat accounting ---------------------------------------
+            # All loop heat, flush and probes included: the slab model's
+            # units (its state already holds heat before the last step).
+            step0 = int(now // tb_slab.STEP * tb_slab.STEP)
+            mark = zs.get("heat_mark")
+            if not mark or mark[0] != step0:
+                zs["heat_mark"] = [step0, zs.get("heat", 0.0)]
+            if calling and dt_min > 0 and sup is not None and ret is not None:
+                zs["heat"] = zs.get("heat", 0.0) + max(0.0, sup - ret) * dt_min
             if (calling and dt_min > 0 and sup is not None and ret is not None
                     and now - zs["call_start"] >= self.flush_min * 60):
                 q = max(0.0, sup - ret) * dt_min
@@ -1499,12 +1541,17 @@ class ThermalBattery(hass.Hass):
                 self._kv_set("pending_grade", p)
 
         self._maybe_start_probes(away, backup, now)
-        # Decide before sessions start: live zones size their charge from it.
-        if (self.slab_enabled and not self.live.get("slab_decided")
-                and self._in_window(now)):
+        # Decide before sessions start, then re-decide through the window
+        # (sun, forecast, backstop heat): live zones charge what it says.
+        last = self.live.get("slab_ts")
+        if (self.slab_enabled and self._in_window(now)
+                and (not self.live.get("slab_decided") or last is None
+                     or now - last >= self.slab_replan_min * 60)):
+            replan = bool(self.live.get("slab_decided"))
             self.live["slab_decided"] = True
+            self.live["slab_ts"] = now
             try:
-                self._slab_decide(now)
+                self._slab_decide(now, replan=replan)
             except Exception as exc:  # noqa: BLE001
                 self.log("slab decision failed: %s" % exc, level="WARNING")
         self._maybe_start_sessions(away, backup, now)
@@ -1641,9 +1688,22 @@ class ThermalBattery(hass.Hass):
 
     @staticmethod
     def _target(zs):
-        """Charge goal: the k budget, raised to the slab model's need for
-        live zones (set at window open by _slab_decide)."""
-        return max(zs["budget"] or 0, zs.get("target") or 0)
+        """Charge goal (C*min): the slab model's need when the zone has a
+        slab decision, else the k budget."""
+        s = zs.get("slab")
+        if s:
+            return s["need"]
+        return zs["budget"] or 0
+
+    @staticmethod
+    def _remaining(zs):
+        """Heat still to deliver. Slab: need minus all loop heat since the
+        decision (flush and backstop heat included - the model counts it).
+        Fallback: budget minus delivered + unplanned."""
+        s = zs.get("slab")
+        if s:
+            return s["need"] - (zs.get("heat", 0.0) - s["base"])
+        return (zs["budget"] or 0) - zs["delivered"] - zs["unplanned"]
 
     def _maybe_start_sessions(self, away, backup, now):
         live = self.live
@@ -1669,8 +1729,8 @@ class ThermalBattery(hass.Hass):
             zs = live["zones"][z["name"]]
             if zs["session"] or zs["done"] or zs["restore"]:
                 continue
-            remaining = self._target(zs) - zs["delivered"] - zs["unplanned"]
-            if remaining <= 0:
+            remaining = self._remaining(zs)
+            if remaining <= (self.min_charge if zs.get("slab") else 0):
                 zs["done"] = True
                 zs["stop_reason"] = zs["stop_reason"] or "no need"
                 continue
@@ -1687,8 +1747,9 @@ class ThermalBattery(hass.Hass):
             self._apply(z, self.charge_setpoint, "charge start, need %.0f"
                         % remaining)
             self._event(z["name"], "session_start",
-                        "budget=%.0f target=%.0f remaining=%.0f"
-                        % (zs["budget"] or 0, self._target(zs), remaining))
+                        "budget=%.0f target=%.0f remaining=%.0f (%s)"
+                        % (zs["budget"] or 0, self._target(zs), remaining,
+                           "slab" if zs.get("slab") else "k fallback"))
             active += add
 
     def _tank_boost(self, away, backup, now):
@@ -1751,7 +1812,7 @@ class ThermalBattery(hass.Hass):
             elif now - sess["start"] >= self.probe_max_min * 60:
                 self._end_session(name, "max time", restore=True)
             return
-        if zs["delivered"] + zs["unplanned"] >= self._target(zs):
+        if self._remaining(zs) <= 0:
             self._end_session(name, "budget reached", restore=True)
         elif zs["run_min"] >= z["max_run_min"]:
             self._end_session(name, "max run", restore=True)
@@ -1783,8 +1844,8 @@ class ThermalBattery(hass.Hass):
                             "%.1f min" % ((fa - sess["start"]) / 60.0)
                             if fa else "-", zs.get("probe_q", 0.0)))
             return
-        self._event(name, "session_end", "%s delivered=%.0f/%s run=%.0fmin"
-                    % (reason, zs["delivered"], zs.get("budget"),
+        self._event(name, "session_end", "%s delivered=%.0f/%.0f run=%.0fmin"
+                    % (reason, zs["delivered"], self._target(zs),
                        zs["run_min"]))
 
     def _verify_restore(self, z, zs, c, now):

@@ -36,7 +36,7 @@ thermal_battery:
   # lows (hind_low - actual_low) over the last `days`, kept in [0, max_c];
   # default_c until a zone has min_n scored nights.
   margin:
-    quantile: 0.8
+    quantile: 0.9
     days: 21
     min_n: 5
     default_c: 0.5
@@ -53,6 +53,11 @@ thermal_battery:
   window_latest: "19:00"    #   inside [earliest, latest]
   window_hours: 5
   min_session_min: 30       # don't start a charge with less window left
+  # Live zones charge the slab model's need (k budget = fallback only),
+  # re-decided this often inside the window. Needs below min_charge C*min
+  # aren't worth a call.
+  slab_replan_min: 30
+  min_charge: 20
   # Zones run at once while their summed `load` (per zone, default 1) stays
   # <= max_load: large zones are load 2, so two of them never run together.
   max_load: 3

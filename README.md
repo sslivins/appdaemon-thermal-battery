@@ -10,7 +10,12 @@ check.
 
 ## How it works
 
-One learned number per zone, `k`:
+Live zones charge what the **slab model** says they need (see
+[Charge decision](#charge-decision-slab-model)): the smallest charge that
+keeps the night's low above target, from the room and slab temperature now,
+the zone's fitted heat loss and solar gain, and the forecast. The fallback,
+when a zone has no usable slab decision, is one learned number per zone,
+`k`:
 
 ```
 budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
@@ -193,12 +198,11 @@ morning low, °C):
 With forecasts as issued, forecast error dominates and the two models are
 close.
 
-### Shadow charge decision
+### Charge decision (slab model)
 
-The 09:00 budget (`k` × HDH) is set hours before charging starts, and
-anything in between (a backstop call, a sunny morning, a new forecast) only
-reaches it through the delivered/unplanned accounting. So when the charge
-window opens, the slab model makes its own decision (logged only):
+The 09:00 budget (`k` × HDH) only knows the weather: not how warm the room
+and slab already are, nor the sun. So when the charge window opens, and
+every `slab_replan_min` (30) after that, the slab model decides:
 
 - it filters all data up to now, so heat from earlier in the day is simply
   part of the slab state
@@ -214,20 +218,26 @@ The margin covers the model's own error: per zone, the `margin.quantile` of
 has `margin.min_n` scored nights). Overshoot for `k` learning is judged
 against the same raised aim.
 
-Heat per sample is weighted by the real time to the next sample, as in the
-app's delivered accounting, so model need and delivered heat are in the
-same units whatever the sample spacing.
+Heat per sample is weighted by the real time to the next sample. The need
+is compared with all loop heat since the decision (`heat` in the zone
+state: flush minutes, probes and backstop calls included, as the model
+counts them), not with `delivered`, which skips the flush.
 
-Each zone's result goes to the `decisions` table and a `slab_decision`
-event, next to the `k` budget still left. At grade, the model is re-run from
-the stored state with the heat and weather that actually happened
-(`added`, `hind_low`), and compared with the actual low. That checks the
-model's heat response.
+The first decision of the day goes to the `decisions` table and a
+`slab_decision` event, next to the `k` budget still left; replans log
+`slab_replan`. At grade, the first decision's model is re-run from the
+stored state with the heat and weather that actually happened (`added`,
+`hind_low`), and compared with the actual low. That checks the model's heat
+response and feeds the margin.
 
-For `live_zones` the decision does drive the charge: a live zone charges
-the larger of its remaining `k` budget and the slab model's need (`target`
-in the zone state; `session_start` logs both). Non-live zones are logged
-only.
+For `live_zones` the decision drives the charge, up or down: a live zone
+charges the slab model's need, zero included (`target` in the zone state;
+`session_start` logs `slab` or `k fallback`). A replan can end a charge
+early or reopen a zone that stopped. Needs under `min_charge` (20) are
+skipped. The `k` budget is only used when a zone has no slab decision (no
+fit, state or forecast), and on slab-controlled days `k` may rise (backstop
+heat) but not fall, so the fallback stays sized for real losses. Non-live
+zones are logged only.
 
 ## Screaming
 

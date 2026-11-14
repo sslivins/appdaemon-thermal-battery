@@ -163,7 +163,7 @@ class ThermalBattery(hass.Hass):
         w = a.get("weather", {}) or {}
         self.lat = float(w.get("latitude", 50.8846))
         self.lon = float(w.get("longitude", -119.8633))
-        self.elev = w.get("elevation", 1315)
+        self.elev = w.get("elevation", 1353)
         self.weather_model = w.get("model")
         self.weather_refresh_min = float(w.get("refresh_min", 30))
         self.weather_stale_h = float(w.get("stale_hours", 3))
@@ -178,6 +178,9 @@ class ThermalBattery(hass.Hass):
         # mass only ever reads warm).
         self.outdoor_entities = list(a.get("outdoor_entities", []) or [])
         self.min_outdoor_cov = float(a.get("min_outdoor_coverage", 0.9))
+        # Above this shortwave (W/m2) the probes read sun-warmed, so measured
+        # HDH uses Open-Meteo's analysis for that hour instead.
+        self.sunny_sw = float(a.get("outdoor_sunny_sw", 100))
 
         # Shadow predictor (logs predicted vs actual morning lows; does not
         # affect the plan).
@@ -517,17 +520,33 @@ class ThermalBattery(hass.Hass):
         return round(min(vals), 2) if vals else None
 
     def _measured_hourly(self, start_ts, end_ts):
-        """{hour_ts: mean measured outdoor temp} from samples."""
+        """{hour_ts: mean measured outdoor temp} from samples.
+
+        Sunny hours (Open-Meteo shortwave > outdoor_sunny_sw) take the
+        analysis temperature: the probes read up to ~2C warm in sun."""
         with self._db_lock:
             rows = self._db.execute(
                 "SELECT ts, outdoor FROM samples WHERE zone=? AND ts>=? AND"
                 " ts<? AND outdoor IS NOT NULL",
                 (self.zones[0]["name"], int(start_ts),
                  int(end_ts))).fetchall()
+            wx = {int(h): (t, sw) for h, t, sw in self._db.execute(
+                "SELECT hour_ts, temp, sw FROM weather_hourly WHERE"
+                " hour_ts>=? AND hour_ts<=?",
+                (int(start_ts) - 3600, int(end_ts) + 3600)).fetchall()}
         b = {}
         for ts, v in rows:
             b.setdefault(int(ts // 3600 * 3600), []).append(v)
-        return {h: sum(v) / len(v) for h, v in b.items()}
+        out = {}
+        for h, v in b.items():
+            out[h] = sum(v) / len(v)
+            # Open-Meteo shortwave is the mean over the preceding hour.
+            sw = [wx[k][1] for k in (h, h + 3600)
+                  if k in wx and wx[k][1] is not None]
+            if (sw and max(sw) > self.sunny_sw and h in wx
+                    and wx[h][0] is not None):
+                out[h] = wx[h][0]
+        return out
 
     def _measured_hdh(self, start_dt, end_dt):
         hrs = self._measured_hourly(start_dt.timestamp(), end_dt.timestamp())

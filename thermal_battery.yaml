@@ -82,7 +82,7 @@ thermal_battery:
   weather:                  # Open-Meteo (no key). House coords from HA.
     latitude: 50.8846
     longitude: -119.8633
-    elevation: 1315
+    elevation: 1353         # Open-Meteo DEM at these coords (was a 1315 guess)
     # Open-Meteo model. best_match resolves to GFS here; Environment Canada's
     # HRDPS blend was ~0.5C closer at night vs the house/AECO/HP1 outdoor
     # sensors (10-day check, Oct 2026).
@@ -108,6 +108,9 @@ thermal_battery:
     - sensor.usl_environmental_temperature_3
     - sensor.mechanical_room_macon_heat_pump_controller_fcec_hp_1_outdoor_temperature
     - sensor.mechanical_room_macon_heat_pump_controller_e540_hp_2_outdoor_temperature
+  # Even the coldest probe reads 1-2C warm in sun; hours where Open-Meteo
+  # shortwave exceeds this (W/m2) use the analysis temp for actual HDH.
+  outdoor_sunny_sw: 100
 
   # Shadow predictor: at plan time and these replan times, predict each zone's
   # no-heat morning low (min of 30-min medians in the last morning_hours of

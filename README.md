@@ -59,7 +59,9 @@ budget[zone] = k[zone] x forecast heating-degree-hours (next 24 h, base 15 C)
     k     += learn_alpha * (needed / actual_HDH - k)   (±max_step_frac/day)
     ```
   - Actual HDH comes from the measured outdoor temperature: the coldest of
-    `outdoor_entities`, logged every minute. If fewer than
+    `outdoor_entities`, logged every minute. Sunny hours (Open-Meteo
+    shortwave above `outdoor_sunny_sw`, 100 W/m²) use the analysis instead,
+    since the probes read up to ~2 °C warm in sun. If fewer than
     `min_outdoor_coverage` (90%) of the hours have readings, it falls back to
     Open-Meteo's analysis. The forecast (`weather.model`, default
     `gem_seamless`) is still what plans; the report compares the 9am forecast
